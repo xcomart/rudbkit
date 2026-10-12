@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/xcomart/rudbkit"
+[workspace.dependencies]
+rudbkit-core = { path = "crates/rudbkit-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+parking_lot = "0.12"
+async-trait = "0.1"
+futures = "0.3"
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+jni = { version = "0.22", features = ["invocation"] }
+thiserror = "2"
