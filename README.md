@@ -45,6 +45,11 @@ Connection saving validates before any write, persists the profile, then writes
 secrets. A secret-store failure can leave the profile on disk; the application
 keeps its form open and retries, and connects only after the current save succeeds.
 
+## Contributing
+
+See the [contribution guide](CONTRIBUTING.md) for development setup, shared API
+contracts, consumer validation and the workflow for submitting changes.
+
 ## License
 
 [MIT](LICENSE).
