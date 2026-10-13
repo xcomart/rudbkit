@@ -131,8 +131,15 @@ contracts should explain how existing consumers keep working.
 `dev` is the integration branch. Fork if needed, branch from the latest upstream
 `dev`, and open a focused pull request targeting `dev`. Maintainers working
 directly in this workspace validate and commit on `dev`, then push to
-`origin/dev`. Follow the existing imperative commit style, such as
-`Fix tunnel lease cleanup` or `Add contribution guide`.
+`origin/dev`.
+
+Use `type: summary` for new commit subjects, with a concise imperative summary.
+Choose `feat`, `fix`, `docs`, `refactor`, `test`, `perf`, `build`, `ci` or `chore`
+to describe the change, for example `fix: preserve tunnel lease ownership`
+or `docs: add contribution guide`. Release and merge commits also use a prefix,
+such as `chore: release <version>` or `chore: merge dev into main`. This convention
+applies across all five repositories; do not rewrite existing history to rename
+older commits.
 
 In the pull request, explain the problem, behavior change and compatibility
 impact. List library checks and consumer checks separately, including anything
