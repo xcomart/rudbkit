@@ -80,7 +80,12 @@ The normal SSH tests start their own servers and need permission to bind
 loopback ports, not an external SSH account. The real-bastion test is ignored;
 read the setup in
 [`crates/rudbkit-ssh/tests/e2e.rs`](crates/rudbkit-ssh/tests/e2e.rs) before
-running it. Its environment variables retain the `RUDBMAN_SSH_TEST_*` prefix.
+running it. Its environment variables use the `RUDBKIT_SSH_TEST_*` prefix.
+
+The JDBC suite's `java_exception` test compiles a small bridge with the local
+JDK (`javac` and `jar`, found through `RUDBKIT_TEST_JAVA_HOME`, `JAVA_HOME` or
+`PATH`) and starts a real JVM. Without a JDK it prints that it was skipped and
+passes.
 
 Shared-library tests alone do not validate the consumers' Java protocols or
 their real JVM/H2 integrations. Check both applications before updating their

@@ -36,7 +36,7 @@
 //! reference counting when several sessions share one — belongs to the
 //! application layer (architecture document, §3.1 and §9.3).
 //!
-//! Three things are worth knowing before using it:
+//! Four things are worth knowing before using it:
 //!
 //! * **The port is the OS's to choose.** `local_port: 0` is the default, and
 //!   [`SshTunnel::local_port`] reports what was actually bound. A fixed port
@@ -44,6 +44,11 @@
 //! * **A tunnel that breaks is never repaired silently.** The failure arrives as
 //!   a [`TunnelEvent::Error`] and the tunnel stays down, because a transaction
 //!   may have been open on top of it and a reconnect would hide that.
+//! * **Every wait is bounded.** Setup as a whole — TCP connect, banner, key
+//!   exchange, authentication — has [`TunnelSpec::setup_timeout_secs`], and a
+//!   running tunnel counts unanswered keepalives, so a bastion that goes silent
+//!   ends in [`SshErrorKind::Timeout`] rather than in a caller waiting forever
+//!   for [`TunnelEvent::Ready`] or for a query to come back.
 //! * **A forwarding refusal is not a connection failure.**
 //!   [`TunnelEvent::ForwardRejected`] says the bastion is reachable but would
 //!   not forward — a different problem, in a different configuration file, than
@@ -68,7 +73,8 @@ mod tunnel;
 mod verify;
 
 pub use config::{
-    DEFAULT_BIND_ADDRESS, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_KEEPALIVE_SECS, SshAuth, TunnelSpec,
+    DEFAULT_BIND_ADDRESS, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_KEEPALIVE_MAX,
+    DEFAULT_KEEPALIVE_SECS, DEFAULT_SETUP_TIMEOUT_SECS, SshAuth, TunnelSpec,
 };
 pub use event::{SshErrorKind, TunnelEvent};
 pub use tunnel::SshTunnel;

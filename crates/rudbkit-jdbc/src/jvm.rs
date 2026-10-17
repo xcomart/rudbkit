@@ -291,11 +291,14 @@ impl Jvm {
     /// Returns the raw response envelope; see
     /// the application protocol decoder.
     ///
-    /// No `ExceptionCheck` on the normal path: the bridge catches every
-    /// `Throwable` and answers with an ERROR envelope, so an exception crossing
-    /// this boundary would be a bridge bug. `jni-rs` still checks after the
-    /// call, which covers the fatal cases (an `OutOfMemoryError` while building
-    /// the response, say).
+    /// The bridge catches every `Throwable` and answers with an ERROR envelope,
+    /// so an exception crossing this boundary is either a bridge bug or a fatal
+    /// case the bridge cannot catch (an `OutOfMemoryError` while building the
+    /// response, say). Such an exception is **caught and cleared here** and comes
+    /// back as [`Error::Jni`] naming its class and message. Left pending, it
+    /// would make every later JNI call on this thread — which, for a session
+    /// worker, is every later call of the session — fail with nothing more than
+    /// "Java exception was thrown".
     pub fn call_attached(
         &self,
         env: &mut Env<'_>,
@@ -308,45 +311,63 @@ impl Jvm {
         // the session, and without this the request and response arrays would
         // pile up in the attachment's frame until the session closed.
         env.with_local_frame(4, |env| {
-            let request = match request {
-                Some(bytes) => env.byte_array_from_slice(bytes)?,
-                None => JByteArray::null(),
-            };
-
-            // `jvalue` is a raw union; writing one is safe, reading it is what
-            // the JNI call below does under the `unsafe`.
-            let args = [
-                jvalue { i: op as jint },
-                jvalue { j: handle },
-                jvalue { j: arg },
-                jvalue {
-                    l: request.as_raw(),
-                },
-            ];
-
-            // SAFETY: `call_method` was looked up on `bridge_class` with the
-            // signature `(IJJ[B)[B`, and the four arguments above are int,
-            // long, long and a byte array in that order.
-            let returned = unsafe {
-                env.call_static_method_unchecked(
-                    &self.bridge_class,
-                    self.call_method,
-                    ReturnType::Array,
-                    &args,
-                )?
-            };
-
-            let object = returned.l()?;
-            if object.is_null() {
-                return Err(Error::Protocol(
-                    "Bridge.call returned null, which it documents it never does".into(),
-                ));
+            let result = self.call_in_frame(env, op, handle, arg, request);
+            // Checked on success too: it costs nothing, and a call that reports
+            // success over a pending exception must not hand it on either.
+            if env.exception_check() {
+                return Err(take_exception(env));
             }
-            // SAFETY: the method's return type is `[B`, and `into_raw` gives up
-            // the only owning wrapper for that reference.
-            let array = unsafe { JByteArray::from_raw(env, object.into_raw()) };
-            Ok(env.convert_byte_array(&array)?)
+            result
         })
+    }
+
+    /// The body of [`call_attached`](Self::call_attached), inside its frame.
+    fn call_in_frame(
+        &self,
+        env: &mut Env<'_>,
+        op: i32,
+        handle: i64,
+        arg: i64,
+        request: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let request = match request {
+            Some(bytes) => env.byte_array_from_slice(bytes)?,
+            None => JByteArray::null(),
+        };
+
+        // `jvalue` is a raw union; writing one is safe, reading it is what
+        // the JNI call below does under the `unsafe`.
+        let args = [
+            jvalue { i: op as jint },
+            jvalue { j: handle },
+            jvalue { j: arg },
+            jvalue {
+                l: request.as_raw(),
+            },
+        ];
+
+        // SAFETY: `call_method` was looked up on `bridge_class` with the
+        // signature `(IJJ[B)[B`, and the four arguments above are int,
+        // long, long and a byte array in that order.
+        let returned = unsafe {
+            env.call_static_method_unchecked(
+                &self.bridge_class,
+                self.call_method,
+                ReturnType::Array,
+                &args,
+            )?
+        };
+
+        let object = returned.l()?;
+        if object.is_null() {
+            return Err(Error::Protocol(
+                "Bridge.call returned null, which it documents it never does".into(),
+            ));
+        }
+        // SAFETY: the method's return type is `[B`, and `into_raw` gives up
+        // the only owning wrapper for that reference.
+        let array = unsafe { JByteArray::from_raw(env, object.into_raw()) };
+        Ok(env.convert_byte_array(&array)?)
     }
 
     /// Invokes `Bridge.call` from a thread that may not be attached, attaching
@@ -366,6 +387,37 @@ impl Jvm {
         self.vm.attach_current_thread_for_scope(|env| {
             self.call_attached(env, op, handle, arg, request)
         })
+    }
+}
+
+/// Catches and clears the pending Java exception, describing it as an error.
+///
+/// Called only when `ExceptionCheck` says one is pending. The clear is repeated
+/// unconditionally at the end because `exception_catch` can fail before it gets
+/// as far as clearing — when the frame it needs cannot be pushed, say — and the
+/// whole point is that the thread leaves here with nothing pending.
+fn take_exception(env: &Env<'_>) -> Error {
+    let error = match env.exception_catch() {
+        Err(jni::errors::Error::CaughtJavaException { name, msg, .. }) => {
+            Error::Jni(describe_exception(&name, &msg))
+        }
+        Err(other) => Error::Jni(format!("a Java exception was thrown: {other}")),
+        Ok(()) => Error::Jni("a Java exception was thrown and vanished before it was read".into()),
+    };
+    env.exception_clear();
+    error
+}
+
+/// Renders a caught exception the way `Throwable.toString` does: the class,
+/// then the message when there is one.
+///
+/// `jni-rs` renders a null message as `<NULL>`, and many exceptions have
+/// none (`NullPointerException` without helpful messages, a bare
+/// `StackOverflowError`), so that placeholder is dropped rather than shown.
+fn describe_exception(class: &str, message: &str) -> String {
+    match message.trim() {
+        "" | "<NULL>" => class.to_string(),
+        message => format!("{class}: {message}"),
     }
 }
 
@@ -494,6 +546,30 @@ mod tests {
             assert!(options.contains(&option.into()));
         }
         assert_eq!(options.last().unwrap(), "-Xmx768m");
+    }
+    #[test]
+    fn a_caught_exception_names_its_class_and_message() {
+        assert_eq!(
+            describe_exception("java.lang.OutOfMemoryError", "Java heap space"),
+            "java.lang.OutOfMemoryError: Java heap space"
+        );
+        // No message: the class alone, never jni-rs's `<NULL>` placeholder.
+        assert_eq!(
+            describe_exception("java.lang.StackOverflowError", "<NULL>"),
+            "java.lang.StackOverflowError"
+        );
+        assert_eq!(
+            describe_exception("java.lang.NullPointerException", ""),
+            "java.lang.NullPointerException"
+        );
+        assert_eq!(
+            Error::Jni(describe_exception(
+                "java.lang.IllegalStateException",
+                "boom"
+            ))
+            .to_string(),
+            "JNI call failed: java.lang.IllegalStateException: boom"
+        );
     }
     #[test]
     fn runtime_and_bridge_candidates_follow_bundle_layouts() {

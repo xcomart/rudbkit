@@ -14,9 +14,9 @@ use futures::StreamExt;
 use futures::executor::block_on;
 use rudbkit_core::{TunnelAuth, TunnelConfig};
 use rudbkit_ssh::{
-    AcceptAllVerifier, DEFAULT_BIND_ADDRESS, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_KEEPALIVE_SECS,
-    HostKeyVerifier, RejectAllVerifier, SshAuth, SshErrorKind, SshTunnel, TunnelEvent, TunnelSpec,
-    algorithm_name, fingerprint,
+    AcceptAllVerifier, DEFAULT_BIND_ADDRESS, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_KEEPALIVE_MAX,
+    DEFAULT_KEEPALIVE_SECS, DEFAULT_SETUP_TIMEOUT_SECS, HostKeyVerifier, RejectAllVerifier,
+    SshAuth, SshErrorKind, SshTunnel, TunnelEvent, TunnelSpec, algorithm_name, fingerprint,
 };
 
 /// A throwaway ed25519 public key, together with the fingerprint OpenSSH prints
@@ -124,7 +124,12 @@ fn new_spec_fills_in_the_documented_defaults() {
     assert_eq!(spec.bind_address, DEFAULT_BIND_ADDRESS);
     assert_eq!(spec.bind_address, Ipv4Addr::LOCALHOST);
     assert_eq!(spec.keepalive_secs, DEFAULT_KEEPALIVE_SECS);
+    assert_eq!(spec.keepalive_max, DEFAULT_KEEPALIVE_MAX);
     assert_eq!(spec.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
+    // Setup is bounded by default: a caller blocking on `Ready` must never be
+    // able to wait for ever.
+    assert_eq!(spec.setup_timeout_secs, DEFAULT_SETUP_TIMEOUT_SECS);
+    assert!(spec.setup_timeout_secs > 0);
 }
 
 #[test]
@@ -148,6 +153,8 @@ fn a_profiles_tunnel_block_converts_field_for_field() {
     assert_eq!(spec.remote_host, config.remote_host);
     assert_eq!(spec.remote_port, config.remote_port);
     assert_eq!(spec.local_port, config.local_port);
+    assert_eq!(spec.keepalive_max, DEFAULT_KEEPALIVE_MAX);
+    assert_eq!(spec.setup_timeout_secs, DEFAULT_SETUP_TIMEOUT_SECS);
     assert!(matches!(
         spec.auth,
         SshAuth::PrivateKeyFile { ref path, ref passphrase }
@@ -386,6 +393,49 @@ fn an_undecodable_private_key_reports_a_key_load_error() {
     assert!(
         !rendered.contains("not actually a key"),
         "key material leaked: {rendered}"
+    );
+}
+
+#[test]
+fn a_bastion_that_never_sends_a_banner_times_out() {
+    // TCP connects — the kernel completes it from the listen backlog — and then
+    // nothing: no banner, no key exchange. Without a limit on setup the tunnel
+    // would sit here for ever, and so would anyone waiting for `Ready` (the
+    // applications hold a per-bastion lock while they wait).
+    let (_bastion, mut spec) = stalled_bastion();
+    spec.setup_timeout_secs = 1;
+
+    let started = Instant::now();
+    // The watchdog is far beyond the limit, so a close by it would show up as
+    // a `Disconnected` instead of the error asserted below.
+    let (port, events) = run_tunnel(spec, Duration::from_secs(20));
+    let elapsed = started.elapsed();
+
+    let error = events.iter().find_map(|event| match event {
+        TunnelEvent::Error(kind, message) => Some((*kind, message.clone())),
+        _ => None,
+    });
+    let Some((kind, message)) = error else {
+        panic!("expected a timeout error, got {events:?}");
+    };
+    assert_eq!(kind, SshErrorKind::Timeout, "{message}");
+    assert!(
+        message.contains("handshake"),
+        "the message must say where setup stalled: {message}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the timeout took {elapsed:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TunnelEvent::Ready { .. })),
+        "the tunnel must not become ready: {events:?}"
+    );
+    assert!(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
+        "port {port} was not released"
     );
 }
 

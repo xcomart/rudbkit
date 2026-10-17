@@ -30,13 +30,14 @@
 //! Point it at one and run it explicitly:
 //!
 //! ```text
-//! export RUDBMAN_SSH_TEST_HOST=bastion.example.com   # required
-//! export RUDBMAN_SSH_TEST_PORT=22                    # optional, defaults to 22
-//! export RUDBMAN_SSH_TEST_USER=ops                   # optional, defaults to $USER
-//! export RUDBMAN_SSH_TEST_PASSWORD=...               # one of these two; without
-//! export RUDBMAN_SSH_TEST_KEY=~/.ssh/id_ed25519      # either, the agent is used
-//! export RUDBMAN_SSH_TEST_REMOTE_HOST=db.internal    # optional, defaults to localhost
-//! export RUDBMAN_SSH_TEST_REMOTE_PORT=22             # optional, defaults to 22
+//! export RUDBKIT_SSH_TEST_HOST=bastion.example.com   # required
+//! export RUDBKIT_SSH_TEST_PORT=22                    # optional, defaults to 22
+//! export RUDBKIT_SSH_TEST_USER=ops                   # optional, defaults to $USER
+//! export RUDBKIT_SSH_TEST_PASSWORD=...               # one of these two; without
+//! export RUDBKIT_SSH_TEST_KEY=~/.ssh/id_ed25519      # either, the agent is used
+//! export RUDBKIT_SSH_TEST_KEY_PASSPHRASE=...         # optional, for an encrypted key
+//! export RUDBKIT_SSH_TEST_REMOTE_HOST=db.internal    # optional, defaults to localhost
+//! export RUDBKIT_SSH_TEST_REMOTE_PORT=22             # optional, defaults to 22
 //!
 //! cargo test -p rudbkit-ssh --test e2e -- --ignored --nocapture
 //! ```
@@ -48,7 +49,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -59,6 +60,8 @@ use rudbkit_ssh::{
 };
 use russh::server::{Auth, ChannelOpenHandle, Handler as ServerHandler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener as AsyncListener, TcpStream as AsyncStream};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -362,6 +365,33 @@ impl Bastion {
         (tunnel, events)
     }
 
+    /// Starts a TCP relay in front of this bastion that [`Relay::silence`] can
+    /// make go quiet.
+    ///
+    /// Runs on the bastion's own runtime, so [`Bastion::kill`] takes it down
+    /// too.
+    fn relay(&self) -> Relay {
+        let servers = self
+            .servers
+            .lock()
+            .expect("the runtime slot is never poisoned");
+        let runtime = servers.as_ref().expect("the bastion is still running");
+        let listener = runtime
+            .block_on(AsyncListener::bind((Ipv4Addr::LOCALHOST, 0)))
+            .expect("binding the relay port must succeed");
+        let port = listener
+            .local_addr()
+            .expect("relay listener address")
+            .port();
+        let silent = Arc::new(AtomicBool::new(false));
+        let task = runtime.spawn(relay_loop(listener, self.port, Arc::clone(&silent)));
+        self.tasks
+            .lock()
+            .expect("the task list is never poisoned")
+            .push(task);
+        Relay { port, silent }
+    }
+
     /// Kills the bastion outright, the way a bastion that loses power dies.
     ///
     /// Aborts the accept loops and then discards the whole runtime, which drops
@@ -422,6 +452,61 @@ async fn accept_loop(
             .lock()
             .expect("the task list is never poisoned")
             .push(session);
+    }
+}
+
+/// A relay between the tunnel and a [`Bastion`], standing in for the network.
+struct Relay {
+    /// Ephemeral port the relay listens on; point the tunnel here.
+    port: u16,
+    /// Once set, every byte is swallowed in both directions.
+    silent: Arc<AtomicBool>,
+}
+
+impl Relay {
+    /// Makes the link go quiet without closing it: what a bastion that lost
+    /// power, or a NAT entry that expired, looks like from the client. Both
+    /// sockets stay open, so nothing short of an unanswered keepalive can tell
+    /// the tunnel anything is wrong.
+    fn silence(&self) {
+        self.silent.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Relays each accepted connection to `target` on loopback until aborted.
+async fn relay_loop(listener: AsyncListener, target: u16, silent: Arc<AtomicBool>) {
+    loop {
+        let Ok((client, _peer)) = listener.accept().await else {
+            return;
+        };
+        let Ok(server) = AsyncStream::connect((Ipv4Addr::LOCALHOST, target)).await else {
+            return;
+        };
+        let (client_read, client_write) = client.into_split();
+        let (server_read, server_write) = server.into_split();
+        tokio::spawn(pump(client_read, server_write, Arc::clone(&silent)));
+        tokio::spawn(pump(server_read, client_write, Arc::clone(&silent)));
+    }
+}
+
+/// Copies one direction of a relayed connection, until the relay is silenced.
+async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, silent: Arc<AtomicBool>) {
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        let Ok(read) = from.read(&mut buffer).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        if silent.load(Ordering::SeqCst) {
+            // Hold both halves open and never write again: the far end sees a
+            // connection that is up and says nothing.
+            std::future::pending::<()>().await;
+        }
+        if to.write_all(&buffer[..read]).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -779,6 +864,41 @@ fn losing_the_bastion_is_reported_as_an_error_and_not_repaired() {
     );
 }
 
+#[test]
+fn a_bastion_that_goes_silent_is_given_up_after_unanswered_keepalives() {
+    let bastion = Bastion::start(Forwarding::Allow);
+    let relay = bastion.relay();
+    let mut spec = bastion.spec();
+    spec.port = relay.port;
+    // Shortened so the loss is noticed in about three seconds rather than in
+    // the production two minutes; the mechanism under test is the same.
+    spec.keepalive_secs = 1;
+    spec.keepalive_max = 2;
+    let (tunnel, mut events) = bastion.open_with(spec);
+    let port = tunnel.local_port();
+
+    let mut socket = Forwarded::connect(port).expect("the forwarded port answers");
+    assert_eq!(socket.round_trip(b"before").expect("echo"), b"before");
+
+    // Half-dead TCP: no FIN, no RST, just silence. Keepalives that are only
+    // *sent* would go into the socket buffer without complaint for minutes.
+    relay.silence();
+
+    let ending = events.wait_for_end();
+    let TunnelEvent::Error(SshErrorKind::Timeout, message) = &ending else {
+        panic!("a bastion that stops answering must time out, got {ending:?}");
+    };
+    assert!(
+        message.contains("keepalive"),
+        "the message must say what went unanswered: {message}"
+    );
+    assert!(!tunnel.is_alive());
+    assert!(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
+        "port {port} was not released"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Against a real server
 // ---------------------------------------------------------------------------
@@ -788,29 +908,29 @@ fn losing_the_bastion_is_reported_as_an_error_and_not_repaired() {
 /// Ignored by default; see the module documentation for the environment
 /// variables it reads and how to run it.
 #[test]
-#[ignore = "needs a real SSH server; see the module docs for RUDBMAN_SSH_TEST_*"]
+#[ignore = "needs a real SSH server; see the module docs for RUDBKIT_SSH_TEST_*"]
 fn a_real_bastion_forwards_a_real_port() {
-    let Ok(host) = std::env::var("RUDBMAN_SSH_TEST_HOST") else {
-        panic!("set RUDBMAN_SSH_TEST_HOST; see the module docs");
+    let Ok(host) = std::env::var("RUDBKIT_SSH_TEST_HOST") else {
+        panic!("set RUDBKIT_SSH_TEST_HOST; see the module docs");
     };
-    let port = env_u16("RUDBMAN_SSH_TEST_PORT", 22);
-    let username = std::env::var("RUDBMAN_SSH_TEST_USER")
+    let port = env_u16("RUDBKIT_SSH_TEST_PORT", 22);
+    let username = std::env::var("RUDBKIT_SSH_TEST_USER")
         .or_else(|_| std::env::var("USER"))
-        .expect("set RUDBMAN_SSH_TEST_USER");
+        .expect("set RUDBKIT_SSH_TEST_USER");
     let auth = match (
-        std::env::var("RUDBMAN_SSH_TEST_PASSWORD"),
-        std::env::var("RUDBMAN_SSH_TEST_KEY"),
+        std::env::var("RUDBKIT_SSH_TEST_PASSWORD"),
+        std::env::var("RUDBKIT_SSH_TEST_KEY"),
     ) {
         (Ok(password), _) => SshAuth::Password(password),
         (_, Ok(path)) => SshAuth::PrivateKeyFile {
             path: path.into(),
-            passphrase: std::env::var("RUDBMAN_SSH_TEST_KEY_PASSPHRASE").ok(),
+            passphrase: std::env::var("RUDBKIT_SSH_TEST_KEY_PASSPHRASE").ok(),
         },
         _ => SshAuth::Agent,
     };
     let remote_host =
-        std::env::var("RUDBMAN_SSH_TEST_REMOTE_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    let remote_port = env_u16("RUDBMAN_SSH_TEST_REMOTE_PORT", 22);
+        std::env::var("RUDBKIT_SSH_TEST_REMOTE_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let remote_port = env_u16("RUDBKIT_SSH_TEST_REMOTE_PORT", 22);
 
     let spec = TunnelSpec::new(host, port, username, auth, remote_host, remote_port);
     // `AcceptAllVerifier` is the right call here and nowhere else: this test

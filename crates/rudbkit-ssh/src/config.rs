@@ -19,8 +19,20 @@ use rudbkit_core::{TunnelAuth, TunnelConfig};
 /// Default keepalive interval, in seconds.
 pub const DEFAULT_KEEPALIVE_SECS: u64 = 30;
 
+/// How many keepalives in a row may go unanswered before the bastion is given
+/// up for dead.
+///
+/// Any packet from the bastion counts as an answer, so a busy tunnel never
+/// sends one; an idle one with the default interval notices a dead peer in
+/// about two minutes.
+pub const DEFAULT_KEEPALIVE_MAX: usize = 3;
+
 /// Default TCP connect timeout, in seconds.
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
+
+/// Default limit, in seconds, on the whole of setup: TCP connect, SSH banner,
+/// key exchange, host key check and authentication together.
+pub const DEFAULT_SETUP_TIMEOUT_SECS: u64 = 30;
 
 /// Address the forwarded port is bound to unless something says otherwise.
 ///
@@ -153,10 +165,30 @@ pub struct TunnelSpec {
     pub bind_address: IpAddr,
     /// Keepalive interval in seconds; `0` disables keepalives. Defaults to
     /// [`DEFAULT_KEEPALIVE_SECS`].
+    ///
+    /// A keepalive is only sent after this long with nothing heard from the
+    /// bastion, and it is what turns a half-dead TCP connection — a bastion that
+    /// lost power, a NAT entry that expired — into an error instead of a tunnel
+    /// that hangs every query sent through it.
     pub keepalive_secs: u64,
+    /// How many keepalives in a row may go unanswered before the tunnel fails
+    /// with [`SshErrorKind::Timeout`](crate::SshErrorKind::Timeout); `0` never
+    /// gives up. Defaults to [`DEFAULT_KEEPALIVE_MAX`].
+    pub keepalive_max: usize,
     /// TCP connect timeout in seconds; `0` disables the timeout and defers to
     /// the operating system. Defaults to [`DEFAULT_CONNECT_TIMEOUT_SECS`].
     pub connect_timeout_secs: u64,
+    /// Limit in seconds on the whole of setup, from the TCP connect to the end
+    /// of authentication; `0` disables it. Defaults to
+    /// [`DEFAULT_SETUP_TIMEOUT_SECS`].
+    ///
+    /// The TCP connect timeout alone does not cover a bastion that accepts the
+    /// connection and then never sends its banner, or stalls in the key
+    /// exchange or in authentication; without this limit such a tunnel never
+    /// reaches [`TunnelEvent::Ready`](crate::TunnelEvent::Ready) *or* an error,
+    /// and a caller waiting for one of them waits forever. The host key
+    /// verifier runs inside this window, so it must answer promptly.
+    pub setup_timeout_secs: u64,
 }
 
 impl TunnelSpec {
@@ -180,7 +212,9 @@ impl TunnelSpec {
             local_port: 0,
             bind_address: DEFAULT_BIND_ADDRESS,
             keepalive_secs: DEFAULT_KEEPALIVE_SECS,
+            keepalive_max: DEFAULT_KEEPALIVE_MAX,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            setup_timeout_secs: DEFAULT_SETUP_TIMEOUT_SECS,
         }
     }
 
@@ -201,7 +235,9 @@ impl TunnelSpec {
             local_port: config.local_port,
             bind_address: DEFAULT_BIND_ADDRESS,
             keepalive_secs: DEFAULT_KEEPALIVE_SECS,
+            keepalive_max: DEFAULT_KEEPALIVE_MAX,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            setup_timeout_secs: DEFAULT_SETUP_TIMEOUT_SECS,
         }
     }
 }
@@ -220,7 +256,9 @@ impl fmt::Debug for TunnelSpec {
             .field("local_port", &self.local_port)
             .field("bind_address", &self.bind_address)
             .field("keepalive_secs", &self.keepalive_secs)
+            .field("keepalive_max", &self.keepalive_max)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("setup_timeout_secs", &self.setup_timeout_secs)
             .finish()
     }
 }
