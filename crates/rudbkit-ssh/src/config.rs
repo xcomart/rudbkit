@@ -68,6 +68,9 @@ pub enum SshAuth {
     /// Public key authentication using a private key read from disk.
     PrivateKeyFile {
         /// Path of the private key file (OpenSSH or PKCS#8 PEM).
+        ///
+        /// A leading `~` or `~/` is expanded to the home directory (`HOME`, or
+        /// `USERPROFILE` on Windows) when the key is read; `~user/…` is not.
         path: PathBuf,
         /// Passphrase, when the key on disk is encrypted.
         passphrase: Option<String>,
