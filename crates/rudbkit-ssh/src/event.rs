@@ -87,9 +87,16 @@ pub enum SshErrorKind {
     /// The local port could not be bound — almost always because something else
     /// already holds it, which is why `local_port: 0` is the default.
     LocalBind,
-    /// Name resolution, TCP connect, connect timeout, or protocol handshake
-    /// failure — the tunnel never reached authentication.
+    /// Name resolution, TCP connect, or protocol handshake failure — the tunnel
+    /// never reached authentication.
     Connect,
+    /// The bastion stopped answering: the TCP connect or the whole of setup
+    /// (banner, key exchange, authentication) ran past its limit, or a running
+    /// tunnel's keepalives went unanswered. Reported apart from
+    /// [`SshErrorKind::Connect`] and [`SshErrorKind::Io`] because the fix is a
+    /// different one — a bastion that is down, firewalled or overloaded, not a
+    /// wrong address or a broken link.
+    Timeout,
     /// The host key verifier refused the key the bastion presented.
     HostKeyRejected,
     /// The bastion rejected our credentials.
@@ -110,6 +117,7 @@ impl fmt::Display for SshErrorKind {
         let text = match self {
             Self::LocalBind => "the local port could not be bound",
             Self::Connect => "connection failed",
+            Self::Timeout => "the bastion did not answer in time",
             Self::HostKeyRejected => "host key rejected",
             Self::Auth => "authentication failed",
             Self::KeyLoad => "private key could not be loaded",

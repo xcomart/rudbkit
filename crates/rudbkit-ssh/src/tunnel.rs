@@ -12,6 +12,7 @@
 //! Asking for a shell on such an account fails a tunnel that would otherwise
 //! have worked.
 
+use std::cell::Cell;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -21,7 +22,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use russh::client::{self, AuthResult, Handle};
+use futures::channel::oneshot;
+use russh::client::{self, AuthResult, DisconnectReason, Handle};
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::{Disconnect, keys};
 use tokio::net::{TcpListener, TcpStream};
@@ -46,6 +48,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// and that the transport is still up. Independent of the keepalive, which the
 /// specification can disable.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a transport that was *seen* closed may take to say why.
+///
+/// russh closes the handle's channel a moment before it tells the handler what
+/// ended the session, so a liveness check can notice the loss first; waiting
+/// this long for the reason is what keeps an unanswered keepalive from being
+/// reported as a plain "connection lost".
+const LOSS_GRACE: Duration = Duration::from_millis(500);
 
 /// How many `accept` calls may fail back to back before the tunnel gives up.
 ///
@@ -279,6 +289,20 @@ enum Ending {
     Failed(SshErrorKind, String),
 }
 
+/// Why an established transport ended, as the handler heard it from russh.
+type Loss = (SshErrorKind, String);
+
+/// How far setup got, so a setup timeout can say where it stalled.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Waiting for the TCP connect.
+    Tcp,
+    /// Connected; waiting for the banner, the key exchange and the host key.
+    Handshake,
+    /// Handshake done; waiting for the bastion to accept the credentials.
+    Auth,
+}
+
 /// Credentials resolved into the form russh wants, with any private key already
 /// parsed and decrypted.
 enum Credentials {
@@ -302,6 +326,13 @@ pub(crate) struct ClientHandler {
     port: u16,
     /// Records the verdict so a handshake error can be attributed correctly.
     key_state: Arc<AtomicU8>,
+    /// Where the reason an established transport ended is sent, once. The
+    /// accept loop waits on the other end, which is what lets it report an
+    /// unanswered keepalive as such — and at once, rather than at the next
+    /// liveness check.
+    lost: Option<oneshot::Sender<Loss>>,
+    /// The keepalive settings, for the message when they run out.
+    keepalive: (u64, usize),
 }
 
 impl client::Handler for ClientHandler {
@@ -336,6 +367,50 @@ impl client::Handler for ClientHandler {
             },
         );
         Ok(accepted)
+    }
+
+    /// Records why the transport ended, then hands the reason back to russh
+    /// exactly as the default implementation would.
+    ///
+    /// Only called once the handshake is over; a failure before that comes back
+    /// from `connect_stream` instead.
+    async fn disconnected(
+        &mut self,
+        reason: DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let (loss, result) = match reason {
+            DisconnectReason::ReceivedDisconnect(info) => {
+                let message = if info.message.is_empty() {
+                    format!("the bastion {} closed the connection", self.host)
+                } else {
+                    format!(
+                        "the bastion {} closed the connection: {}",
+                        self.host, info.message
+                    )
+                };
+                ((SshErrorKind::Io, message), Ok(()))
+            }
+            DisconnectReason::Error(russh::Error::KeepaliveTimeout) => {
+                let (secs, max) = self.keepalive;
+                let message = format!(
+                    "the bastion {} stopped answering: {max} keepalives sent {secs}s apart \
+                     went unanswered",
+                    self.host
+                );
+                (
+                    (SshErrorKind::Timeout, message),
+                    Err(russh::Error::KeepaliveTimeout),
+                )
+            }
+            DisconnectReason::Error(error) => {
+                let message = format!("the connection to the bastion was lost: {error}");
+                ((SshErrorKind::Io, message), Err(error))
+            }
+        };
+        if let Some(lost) = self.lost.take() {
+            let _ = lost.send(loss);
+        }
+        result
     }
 }
 
@@ -422,8 +497,9 @@ async fn run(
 
     // Racing setup against the command channel keeps a dropped `SshTunnel` from
     // leaving this thread stuck in a long connect.
+    let (lost_tx, mut lost) = oneshot::channel();
     let outcome = tokio::select! {
-        result = connect(&spec, &verifier, events) => Some(result),
+        result = connect(&spec, &verifier, events, lost_tx) => Some(result),
         () = wait_for_close(&mut commands) => None,
     };
 
@@ -462,7 +538,7 @@ async fn run(
     // `accept_loop` consumes the listener, so the local port is closed by the
     // time it returns — which is before the terminal event below. A caller that
     // waits for `Disconnected` can therefore rebind the port immediately.
-    let ending = accept_loop(&spec, &handle, listener, &mut commands, events).await;
+    let ending = accept_loop(&spec, &handle, listener, &mut commands, &mut lost, events).await;
     alive.store(false, Ordering::SeqCst);
     shutdown(&handle).await;
 
@@ -485,20 +561,73 @@ async fn wait_for_close(commands: &mut UnboundedReceiver<Command>) {
     }
 }
 
-/// Loads credentials, connects to the bastion and authenticates.
+/// Loads credentials, connects to the bastion and authenticates, all within
+/// [`TunnelSpec::setup_timeout_secs`].
 ///
 /// Stops there on purpose: a tunnel needs no session channel, no pty and no
 /// shell, and asking for any of them would break on a bastion account whose
 /// login shell is `nologin`.
+///
+/// The limit covers everything after the key file is read, because the TCP
+/// connect timeout alone leaves the rest unbounded: a bastion that accepts the
+/// connection and never sends its banner — a wedged sshd, a port forwarded to
+/// something that is not SSH — would otherwise hold this worker, and any caller
+/// waiting for [`TunnelEvent::Ready`], for ever.
 async fn connect(
     spec: &TunnelSpec,
     verifier: &Arc<dyn HostKeyVerifier>,
     events: &UnboundedSender<TunnelEvent>,
+    lost: oneshot::Sender<Loss>,
 ) -> Result<Handle<ClientHandler>, Failure> {
     // Done first so a bad key path fails fast, before touching the network.
     let credentials = load_credentials(&spec.auth)?;
 
+    let phase = Cell::new(Phase::Tcp);
+    let setup = establish(spec, verifier, events, lost, credentials, &phase);
+    if spec.setup_timeout_secs == 0 {
+        return setup.await;
+    }
+    let limit = Duration::from_secs(spec.setup_timeout_secs);
+    match tokio::time::timeout(limit, setup).await {
+        Ok(result) => result,
+        Err(_) => Err(setup_timed_out(spec, phase.get())),
+    }
+}
+
+/// The failure reported when setup runs past its limit, naming the step that
+/// stalled — each one points at a different culprit.
+fn setup_timed_out(spec: &TunnelSpec, phase: Phase) -> Failure {
+    let secs = spec.setup_timeout_secs;
+    let message = match phase {
+        Phase::Tcp => format!(
+            "connecting to {}:{} timed out after {secs}s",
+            spec.host, spec.port
+        ),
+        Phase::Handshake => format!(
+            "{}:{} accepted the connection but did not complete the SSH handshake within \
+             {secs}s; check that it is an SSH server and that it is not overloaded",
+            spec.host, spec.port
+        ),
+        Phase::Auth => format!(
+            "the bastion {} did not finish authenticating user {} within {secs}s",
+            spec.host, spec.username
+        ),
+    };
+    Failure::new(SshErrorKind::Timeout, message)
+}
+
+/// The body of [`connect`]: TCP connect, handshake, authentication, with
+/// `phase` kept up to date for the timeout's message.
+async fn establish(
+    spec: &TunnelSpec,
+    verifier: &Arc<dyn HostKeyVerifier>,
+    events: &UnboundedSender<TunnelEvent>,
+    lost: oneshot::Sender<Loss>,
+    credentials: Credentials,
+    phase: &Cell<Phase>,
+) -> Result<Handle<ClientHandler>, Failure> {
     let stream = tcp_connect(spec).await?;
+    phase.set(Phase::Handshake);
     let key_state = Arc::new(AtomicU8::new(KEY_UNCHECKED));
     let handler = ClientHandler {
         verifier: Arc::clone(verifier),
@@ -506,13 +635,21 @@ async fn connect(
         host: spec.host.clone(),
         port: spec.port,
         key_state: Arc::clone(&key_state),
+        lost: Some(lost),
+        keepalive: (spec.keepalive_secs, spec.keepalive_max),
     };
 
     let client_config = client::Config {
-        // Keepalives are driven by the accept loop instead, so that russh and
-        // this crate never both ping the bastion.
+        // russh's own keepalive rather than one sent from the accept loop: it
+        // only fires after `keepalive_secs` with nothing heard, and it counts
+        // the ones that go unanswered — any packet from the bastion counts as
+        // an answer — and ends the session after `keepalive_max` of them. A
+        // keepalive that is merely *sent* proves nothing: on a half-dead TCP
+        // connection the write succeeds into the kernel's buffer for minutes.
         inactivity_timeout: None,
-        keepalive_interval: None,
+        keepalive_interval: (spec.keepalive_secs > 0)
+            .then(|| Duration::from_secs(spec.keepalive_secs)),
+        keepalive_max: spec.keepalive_max,
         ..client::Config::default()
     };
 
@@ -535,6 +672,7 @@ async fn connect(
             }
         })?;
 
+    phase.set(Phase::Auth);
     authenticate(&mut handle, spec, credentials).await?;
     Ok(handle)
 }
@@ -596,7 +734,7 @@ async fn tcp_connect(spec: &TunnelSpec) -> Result<TcpStream, Failure> {
             }
             Err(_) => {
                 return Err(Failure::new(
-                    SshErrorKind::Connect,
+                    SshErrorKind::Timeout,
                     format!(
                         "connecting to {}:{} timed out after {}s",
                         spec.host, spec.port, spec.connect_timeout_secs
@@ -788,6 +926,9 @@ enum Step {
     Accepted(io::Result<(TcpStream, SocketAddr)>),
     /// A command arrived from the owning thread.
     Command(Option<Command>),
+    /// The handler reported why the transport ended, or went away without
+    /// saying.
+    Lost(Option<Loss>),
     /// The keepalive timer fired.
     Keepalive,
     /// The liveness timer fired.
@@ -803,6 +944,7 @@ async fn accept_loop(
     handle: &Arc<Handle<ClientHandler>>,
     listener: TcpListener,
     commands: &mut UnboundedReceiver<Command>,
+    lost: &mut oneshot::Receiver<Loss>,
     events: &UnboundedSender<TunnelEvent>,
 ) -> Ending {
     let mut keepalive = keepalive_timer(spec.keepalive_secs);
@@ -814,6 +956,7 @@ async fn accept_loop(
         let step = tokio::select! {
             accepted = listener.accept() => Step::Accepted(accepted),
             command = commands.next() => Step::Command(command),
+            loss = &mut *lost => Step::Lost(loss.ok()),
             () = tick(&mut keepalive) => Step::Keepalive,
             _ = liveness.tick() => Step::Liveness,
         };
@@ -864,18 +1007,16 @@ async fn accept_loop(
             Step::Command(None) => {
                 return Ending::Closed("the tunnel handle was dropped".to_owned());
             }
+            Step::Lost(Some((kind, message))) => return Ending::Failed(kind, message),
+            // The handler is dropped with russh's session task, so this is the
+            // session ending by a path that never reached `disconnected`.
+            Step::Lost(None) => return connection_lost(),
             Step::Keepalive => {
+                // russh sends the keepalives and counts the unanswered ones;
+                // this tick only makes sure a loss is noticed within one
+                // keepalive interval even if nothing reported it.
                 if handle.is_closed() {
-                    return Ending::Failed(
-                        SshErrorKind::Io,
-                        "the connection to the bastion was lost".to_owned(),
-                    );
-                }
-                if let Err(error) = handle.send_keepalive(true).await {
-                    return Ending::Failed(
-                        SshErrorKind::Io,
-                        format!("the keepalive to the bastion failed: {error}"),
-                    );
+                    return lost_ending(lost).await;
                 }
             }
             Step::Liveness => {
@@ -889,14 +1030,28 @@ async fn accept_loop(
                 // quiet reconnect: a transaction may have been open on it, and
                 // the user has to be told (architecture document, §9.3).
                 if handle.is_closed() {
-                    return Ending::Failed(
-                        SshErrorKind::Io,
-                        "the connection to the bastion was lost".to_owned(),
-                    );
+                    return lost_ending(lost).await;
                 }
             }
         }
     }
+}
+
+/// The ending for a transport found closed: the handler's reason if it arrives
+/// within [`LOSS_GRACE`], a generic loss otherwise.
+async fn lost_ending(lost: &mut oneshot::Receiver<Loss>) -> Ending {
+    match tokio::time::timeout(LOSS_GRACE, lost).await {
+        Ok(Ok((kind, message))) => Ending::Failed(kind, message),
+        _ => connection_lost(),
+    }
+}
+
+/// The ending for a transport that ended without saying why.
+fn connection_lost() -> Ending {
+    Ending::Failed(
+        SshErrorKind::Io,
+        "the connection to the bastion was lost".to_owned(),
+    )
 }
 
 /// Builds the keepalive timer, or `None` when keepalives are disabled.
