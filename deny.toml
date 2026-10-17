@@ -1,0 +1,45 @@
+# What `cargo deny check` (the `deny` jobs in .github/workflows/ci.yml)
+# accepts in the dependency graph. Advisories are checked in their own,
+# non-blocking job; licences, bans and sources block.
+
+[graph]
+# Optional features count: a licence or source that only arrives behind a
+# feature still ends up in someone's build.
+all-features = true
+
+[advisories]
+# Defaults: vulnerabilities, unmaintained and unsound crates and yanked
+# versions are all errors. Ignore an advisory here only with the RUSTSEC id and
+# a comment saying why it does not apply.
+ignore = []
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+
+[bans]
+# The gpui graph carries many duplicate versions that this workspace cannot
+# unify; reporting them would only be noise.
+multiple-versions = "allow"
+# Workspace crates depend on each other by path without a version.
+wildcards = "allow"
+# Every TLS and SSH stack here is pinned to its `ring` backend so that no
+# NASM, CMake or system OpenSSL is needed on any build machine. Keep it so.
+deny = [
+    { crate = "aws-lc-sys", reason = "use the ring backend; aws-lc needs NASM/CMake on Windows" },
+    { crate = "aws-lc-rs", reason = "use the ring backend; aws-lc needs NASM/CMake on Windows" },
+    { crate = "openssl-sys", reason = "use the ring backend; no system OpenSSL on build machines" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git dependencies. A new one has to be listed here on purpose.
+allow-git = []
