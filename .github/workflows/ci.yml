@@ -145,6 +145,23 @@ jobs:
           touch "$RUNNER_TEMP/bridge-placeholder.jar"
           echo "RUDBMAN_BRIDGE_JAR=$RUNNER_TEMP/bridge-placeholder.jar" >> "$GITHUB_ENV"
           echo "RUDBGEN_BRIDGE_JAR=$RUNNER_TEMP/bridge-placeholder.jar" >> "$GITHUB_ENV"
+      # A version bump in rudbkit leaves the application's lockfile naming the
+      # old version, and Cargo keeps a locked version rather than take a patch
+      # carrying a newer one: the patch is reported unused and the check below
+      # fails on every release. Re-resolving the patched crates the
+      # application actually uses lets the path crates replace them whatever
+      # version they carry. Only `[[package]]` names count -- a `[[patch.unused]]`
+      # entry names a crate `cargo update -p` would refuse.
+      - name: Re-resolve the patched crates
+        working-directory: app
+        run: |
+          specs=()
+          for crate in rudbkit-core rudbkit-ssh rudbkit-jdbc; do
+            if grep -A1 -x '\[\[package\]\]' Cargo.lock | grep -qx "name = \"$crate\""; then
+              specs+=(-p "$crate")
+            fi
+          done
+          cargo update --config "$RUNNER_TEMP/rudbkit-under-test.toml" "${specs[@]}"
       # A crate the table above forgot would still resolve -- from the pinned
       # git revision -- and the check below would pass against the old code.
       - name: Nothing left on the pinned rudbkit revision
