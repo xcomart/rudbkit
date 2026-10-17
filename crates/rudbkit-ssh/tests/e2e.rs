@@ -30,13 +30,14 @@
 //! Point it at one and run it explicitly:
 //!
 //! ```text
-//! export RUDBMAN_SSH_TEST_HOST=bastion.example.com   # required
-//! export RUDBMAN_SSH_TEST_PORT=22                    # optional, defaults to 22
-//! export RUDBMAN_SSH_TEST_USER=ops                   # optional, defaults to $USER
-//! export RUDBMAN_SSH_TEST_PASSWORD=...               # one of these two; without
-//! export RUDBMAN_SSH_TEST_KEY=~/.ssh/id_ed25519      # either, the agent is used
-//! export RUDBMAN_SSH_TEST_REMOTE_HOST=db.internal    # optional, defaults to localhost
-//! export RUDBMAN_SSH_TEST_REMOTE_PORT=22             # optional, defaults to 22
+//! export RUDBKIT_SSH_TEST_HOST=bastion.example.com   # required
+//! export RUDBKIT_SSH_TEST_PORT=22                    # optional, defaults to 22
+//! export RUDBKIT_SSH_TEST_USER=ops                   # optional, defaults to $USER
+//! export RUDBKIT_SSH_TEST_PASSWORD=...               # one of these two; without
+//! export RUDBKIT_SSH_TEST_KEY=~/.ssh/id_ed25519      # either, the agent is used
+//! export RUDBKIT_SSH_TEST_KEY_PASSPHRASE=...         # optional, for an encrypted key
+//! export RUDBKIT_SSH_TEST_REMOTE_HOST=db.internal    # optional, defaults to localhost
+//! export RUDBKIT_SSH_TEST_REMOTE_PORT=22             # optional, defaults to 22
 //!
 //! cargo test -p rudbkit-ssh --test e2e -- --ignored --nocapture
 //! ```
@@ -788,29 +789,29 @@ fn losing_the_bastion_is_reported_as_an_error_and_not_repaired() {
 /// Ignored by default; see the module documentation for the environment
 /// variables it reads and how to run it.
 #[test]
-#[ignore = "needs a real SSH server; see the module docs for RUDBMAN_SSH_TEST_*"]
+#[ignore = "needs a real SSH server; see the module docs for RUDBKIT_SSH_TEST_*"]
 fn a_real_bastion_forwards_a_real_port() {
-    let Ok(host) = std::env::var("RUDBMAN_SSH_TEST_HOST") else {
-        panic!("set RUDBMAN_SSH_TEST_HOST; see the module docs");
+    let Ok(host) = std::env::var("RUDBKIT_SSH_TEST_HOST") else {
+        panic!("set RUDBKIT_SSH_TEST_HOST; see the module docs");
     };
-    let port = env_u16("RUDBMAN_SSH_TEST_PORT", 22);
-    let username = std::env::var("RUDBMAN_SSH_TEST_USER")
+    let port = env_u16("RUDBKIT_SSH_TEST_PORT", 22);
+    let username = std::env::var("RUDBKIT_SSH_TEST_USER")
         .or_else(|_| std::env::var("USER"))
-        .expect("set RUDBMAN_SSH_TEST_USER");
+        .expect("set RUDBKIT_SSH_TEST_USER");
     let auth = match (
-        std::env::var("RUDBMAN_SSH_TEST_PASSWORD"),
-        std::env::var("RUDBMAN_SSH_TEST_KEY"),
+        std::env::var("RUDBKIT_SSH_TEST_PASSWORD"),
+        std::env::var("RUDBKIT_SSH_TEST_KEY"),
     ) {
         (Ok(password), _) => SshAuth::Password(password),
         (_, Ok(path)) => SshAuth::PrivateKeyFile {
             path: path.into(),
-            passphrase: std::env::var("RUDBMAN_SSH_TEST_KEY_PASSPHRASE").ok(),
+            passphrase: std::env::var("RUDBKIT_SSH_TEST_KEY_PASSPHRASE").ok(),
         },
         _ => SshAuth::Agent,
     };
     let remote_host =
-        std::env::var("RUDBMAN_SSH_TEST_REMOTE_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    let remote_port = env_u16("RUDBMAN_SSH_TEST_REMOTE_PORT", 22);
+        std::env::var("RUDBKIT_SSH_TEST_REMOTE_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let remote_port = env_u16("RUDBKIT_SSH_TEST_REMOTE_PORT", 22);
 
     let spec = TunnelSpec::new(host, port, username, auth, remote_host, remote_port);
     // `AcceptAllVerifier` is the right call here and nowhere else: this test
