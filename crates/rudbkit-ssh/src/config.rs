@@ -223,9 +223,9 @@ impl TunnelSpec {
 
     /// Converts the `tunnel` block of a connection profile.
     ///
-    /// `secret` is whatever the keychain holds for this profile's
-    /// the application’s tunnel secret slot — a password or
-    /// a key passphrase, depending on the method. See
+    /// `secret` is whatever the application's keychain holds in this
+    /// profile's tunnel secret slot — a password or a key passphrase,
+    /// depending on the method. See
     /// [`SshAuth::from_tunnel_auth`].
     pub fn from_config(config: &TunnelConfig, secret: Option<String>) -> Self {
         Self {
