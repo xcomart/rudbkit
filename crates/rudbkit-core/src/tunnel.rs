@@ -22,6 +22,11 @@ pub enum TunnelAuth {
     /// Public key authentication using the private key at `path`.
     Key {
         /// Path of the private key file to offer to the bastion.
+        ///
+        /// Stored as written: a leading `~` or `~/` is expanded to the home
+        /// directory only when `rudbkit-ssh` reads the key, so a saved
+        /// `~/.ssh/id_ed25519` follows the user running the app. `~user/…` is
+        /// not expanded.
         path: PathBuf,
     },
     /// Password authentication, with the password read from the keychain.

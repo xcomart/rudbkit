@@ -70,6 +70,7 @@ pub struct JvmConfig {
     heap_mb: u32,
     extra_args: Vec<String>,
     language: Option<String>,
+    script: Option<String>,
     country: Option<String>,
 }
 
@@ -83,19 +84,24 @@ impl JvmConfig {
             heap_mb: 1024,
             extra_args: Vec::new(),
             language: None,
+            script: None,
             country: None,
         }
     }
 
     /// Sets the Java locale from a BCP 47 language tag.
+    ///
+    /// Only the parts Java's start-up locale is built from are kept — language,
+    /// script and region — and `_` is accepted in place of `-`, so
+    /// `zh-Hans-CN`, `zh_TW`, `sr-Latn-RS` and `es-419` all come out right. A tag whose language subtag is malformed sets nothing, leaving
+    /// the JVM on the OS locale rather than on a half-understood one. `None`
+    /// leaves any earlier setting alone.
     pub fn with_locale(mut self, tag: Option<&str>) -> Self {
         if let Some(tag) = tag {
-            let mut parts = tag.split(['-', '_']);
-            self.language = parts
-                .next()
-                .filter(|part| !part.is_empty())
-                .map(str::to_string);
-            self.country = parts.next().map(str::to_uppercase);
+            let locale = parse_locale(tag);
+            self.language = locale.language;
+            self.script = locale.script;
+            self.country = locale.region;
         }
         self
     }
@@ -147,6 +153,11 @@ impl JvmConfig {
         if let Some(language) = &self.language {
             options.push(format!("-Duser.language={language}"));
         }
+        // `user.script` has been read by `Locale`'s start-up default since
+        // Java 7, and the runtime floor is 17.
+        if let Some(script) = &self.script {
+            options.push(format!("-Duser.script={script}"));
+        }
         if let Some(country) = &self.country {
             options.push(format!("-Duser.country={country}"));
         }
@@ -168,6 +179,65 @@ impl JvmConfig {
             .chain(std::env::var_os(self.identity.java_home_env).map(PathBuf::from))
             .chain(std::env::var_os("JAVA_HOME").map(PathBuf::from))
             .find(|candidate| is_java_home(candidate))
+    }
+}
+
+/// The parts of a language tag that Java's start-up locale is built from.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LocaleParts {
+    /// ISO 639 language, lowercase (`user.language`).
+    language: Option<String>,
+    /// ISO 15924 script, title case (`user.script`).
+    script: Option<String>,
+    /// ISO 3166 alpha-2 region, uppercase, or a UN M.49 numeric region such
+    /// as `419` (`user.country`).
+    region: Option<String>,
+}
+
+/// Splits a BCP 47 tag — loosely: `_` separators, any casing, and a POSIX
+/// `.codeset`/`@modifier` tail are tolerated — into language, script and
+/// region.
+///
+/// The grammar is RFC 5646's `language [-extlang] [-script] [-region]`, read
+/// left to right with each optional subtag recognised by its shape: a script is
+/// four letters, a region two letters or three digits. Extended language
+/// subtags, variants, extensions and private use are dropped — Java's
+/// `user.variant` takes its own non-BCP 47 syntax, and none of them changes
+/// which language a driver answers in. A first subtag that is not two to eight
+/// letters (`x-private`, `i-klingon`, an empty string, digits) makes the whole
+/// tag unusable and yields nothing at all.
+fn parse_locale(tag: &str) -> LocaleParts {
+    let tag = tag.split(['.', '@']).next().unwrap_or_default().trim();
+    let mut subtags = tag.split(['-', '_']).peekable();
+    let is_alpha = |part: &str, lengths: std::ops::RangeInclusive<usize>| {
+        lengths.contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphabetic())
+    };
+    let Some(language) = subtags.next().filter(|part| is_alpha(part, 2..=8)) else {
+        return LocaleParts::default();
+    };
+    // Up to three extlang subtags (`zh-yue`), only after a short language.
+    if language.len() <= 3 {
+        for _ in 0..3 {
+            if subtags.next_if(|part| is_alpha(part, 3..=3)).is_none() {
+                break;
+            }
+        }
+    }
+    let script = subtags.next_if(|part| is_alpha(part, 4..=4)).map(|part| {
+        let mut script = part.to_ascii_lowercase();
+        script[..1].make_ascii_uppercase();
+        script
+    });
+    let region = subtags
+        .next_if(|part| {
+            is_alpha(part, 2..=2)
+                || (part.len() == 3 && part.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .map(str::to_ascii_uppercase);
+    LocaleParts {
+        language: Some(language.to_ascii_lowercase()),
+        script,
+        region,
     }
 }
 
@@ -546,6 +616,56 @@ mod tests {
             assert!(options.contains(&option.into()));
         }
         assert_eq!(options.last().unwrap(), "-Xmx768m");
+    }
+    #[test]
+    fn language_tags_map_onto_java_locale_properties() {
+        let parts = |tag| {
+            let locale = parse_locale(tag);
+            (locale.language, locale.script, locale.region)
+        };
+        let some = |value: &str| Some(value.to_string());
+        assert_eq!(parts("zh-Hans-CN"), (some("zh"), some("Hans"), some("CN")));
+        assert_eq!(parts("zh_TW"), (some("zh"), None, some("TW")));
+        assert_eq!(parts("sr-Latn-RS"), (some("sr"), some("Latn"), some("RS")));
+        assert_eq!(parts("en"), (some("en"), None, None));
+        assert_eq!(parts("pt-BR"), (some("pt"), None, some("BR")));
+        assert_eq!(parts("es-419"), (some("es"), None, some("419")));
+        // Odd casing, POSIX tails, extlang, variants and extensions.
+        assert_eq!(parts("ZH_hant_tw"), (some("zh"), some("Hant"), some("TW")));
+        assert_eq!(parts("de_DE.UTF-8"), (some("de"), None, some("DE")));
+        assert_eq!(parts("zh-yue-HK"), (some("zh"), None, some("HK")));
+        assert_eq!(
+            parts("de-CH-1901-u-co-phonebk"),
+            (some("de"), None, some("CH"))
+        );
+        assert_eq!(parts("en-u-ca-gregory"), (some("en"), None, None));
+        // Garbage sets nothing.
+        for tag in ["", "-", "x-private", "1234", "e", "en!", "toolonglanguage"] {
+            assert_eq!(parse_locale(tag), LocaleParts::default(), "{tag:?}");
+        }
+        // A region must be two letters or three digits; anything else is not
+        // promoted to one.
+        assert_eq!(parts("en-12"), (some("en"), None, None));
+        assert_eq!(parts("en-USA"), (some("en"), None, None));
+    }
+    #[test]
+    fn locale_options_carry_script_and_skip_garbage() {
+        let options = JvmConfig::new("bridge.jar", ID)
+            .with_locale(Some("zh-Hans-CN"))
+            .options();
+        for option in [
+            "-Duser.language=zh",
+            "-Duser.script=Hans",
+            "-Duser.country=CN",
+        ] {
+            assert!(options.contains(&option.into()), "{option}");
+        }
+        assert!(!options.iter().any(|option| option == "-Duser.country=HANS"));
+        let options = JvmConfig::new("bridge.jar", ID)
+            .with_locale(Some("zh-CN"))
+            .with_locale(Some("garbage!"))
+            .options();
+        assert!(!options.iter().any(|option| option.starts_with("-Duser.")));
     }
     #[test]
     fn a_caught_exception_names_its_class_and_message() {

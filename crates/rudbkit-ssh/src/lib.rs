@@ -25,7 +25,7 @@
 //! // Ready to be substituted into a connection URL: with `local_port` left at
 //! // 0 the operating system picked a free one, and this is which.
 //! println!("forwarding 127.0.0.1:{}", tunnel.local_port());
-//! while let Ok(Some(event)) = events.try_next() {
+//! while let Ok(event) = events.try_recv() {
 //!     println!("{event:?}");
 //! }
 //! ```

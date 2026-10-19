@@ -68,6 +68,9 @@ pub enum SshAuth {
     /// Public key authentication using a private key read from disk.
     PrivateKeyFile {
         /// Path of the private key file (OpenSSH or PKCS#8 PEM).
+        ///
+        /// A leading `~` or `~/` is expanded to the home directory (`HOME`, or
+        /// `USERPROFILE` on Windows) when the key is read; `~user/…` is not.
         path: PathBuf,
         /// Passphrase, when the key on disk is encrypted.
         passphrase: Option<String>,
@@ -220,9 +223,9 @@ impl TunnelSpec {
 
     /// Converts the `tunnel` block of a connection profile.
     ///
-    /// `secret` is whatever the keychain holds for this profile's
-    /// the application’s tunnel secret slot — a password or
-    /// a key passphrase, depending on the method. See
+    /// `secret` is whatever the application's keychain holds in this
+    /// profile's tunnel secret slot — a password or a key passphrase,
+    /// depending on the method. See
     /// [`SshAuth::from_tunnel_auth`].
     pub fn from_config(config: &TunnelConfig, secret: Option<String>) -> Self {
         Self {

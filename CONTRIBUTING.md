@@ -19,8 +19,10 @@ especially useful.
 
 ## Development environment
 
-Use Git, stable Rust, `rustfmt`, `clippy` and a native compiler toolchain. The
-workspace uses edition 2024. There is no GUI dependency, no Java bridge to build
+Use Git, Rust 1.98.0 with `rustfmt` and `clippy`, and a native compiler
+toolchain. CI pins that toolchain to match the applications and checks the
+latest stable release only in a non-blocking job. The workspace uses edition
+2024. There is no GUI dependency, no Java bridge to build
 here, and no application binary to launch.
 
 From a checkout of `dev`:
@@ -41,6 +43,15 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
 
 In PowerShell, set `$env:RUSTDOCFLAGS = '-D warnings'` before the `cargo doc`
 command. See [CI](.github/workflows/ci.yml) for the current platform matrix.
+
+CI also runs [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) against
+[`deny.toml`](deny.toml). Licence, ban and source checks block; advisories are
+reported in a separate non-blocking job. When changing dependencies, run:
+
+```sh
+cargo deny --locked check bans licenses sources
+cargo deny --locked check advisories
+```
 
 ## Where changes belong
 
@@ -103,17 +114,26 @@ rudbkit-jdbc = { path = "../rudbkit/crates/rudbkit-jdbc" }
 
 Merge this table into existing local configuration; do not overwrite unrelated
 settings. A path override changes dependency resolution, so first let Cargo
-update the application's local lockfile without `--locked`:
+update the application's local lockfile without `--locked`. Re-resolve the
+three crates explicitly: when the local workspace version differs from the one
+in the application's lockfile, Cargo keeps the locked Git revision and reports
+the patch as unused.
 
 ```sh
 # In rudbgen, after building its bridge:
+cargo update -p rudbkit-core -p rudbkit-ssh -p rudbkit-jdbc
 cargo check --workspace
 cargo test --workspace --locked
 
 # Repeat in rudbman, after building its bridge:
+cargo update -p rudbkit-core -p rudbkit-ssh -p rudbkit-jdbc
 cargo check --workspace
 cargo test --workspace --locked
 ```
+
+CI's non-blocking `consumer` jobs run `cargo check` for each application's
+`dev` branch against the commit under test in the same way. They do not build
+the bridges or run the applications' tests.
 
 Both consumers need JDK 17+ and their own bridge built with
 `./gradlew build --no-daemon` inside `bridge` (`.\gradlew.bat` on Windows).

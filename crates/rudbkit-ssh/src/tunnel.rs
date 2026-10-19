@@ -12,10 +12,12 @@
 //! Asking for a shell on such an account fails a tunnel that would otherwise
 //! have worked.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
@@ -683,9 +685,12 @@ fn load_credentials(auth: &SshAuth) -> Result<Credentials, Failure> {
         SshAuth::Password(password) => Ok(Credentials::Password(password.clone())),
         SshAuth::Agent => Ok(Credentials::Agent),
         SshAuth::PrivateKeyFile { path, passphrase } => {
+            // Expanded here, at the one place the file is read, so a stored
+            // `~/.ssh/id_ed25519` keeps meaning whoever runs the app.
+            let path = expand_home(path, home_dir);
             // russh's error messages describe the failure only, never the
             // passphrase, so they are safe to surface and to log.
-            keys::load_secret_key(path, passphrase.as_deref())
+            keys::load_secret_key(&path, passphrase.as_deref())
                 .map(|key| Credentials::Key(Arc::new(key)))
                 .map_err(|error| {
                     Failure::new(
@@ -708,6 +713,41 @@ fn load_credentials(auth: &SshAuth) -> Result<Credentials, Failure> {
                 })
         }
     }
+}
+
+/// Replaces a leading `~` component with the home directory `home` returns.
+///
+/// Only `~` alone and `~/…` (`~\…` on Windows) are expanded — the shell's
+/// `~user/…` form needs a password database lookup this crate has no business
+/// doing, so it is left as is, as is a `~` anywhere but first. So is the whole
+/// path when `home` has no answer: the load then fails naming the path as
+/// written, which is the clearest thing left to report. `home` is only called
+/// for a path that needs it.
+fn expand_home(path: &Path, home: impl FnOnce() -> Option<PathBuf>) -> Cow<'_, Path> {
+    let Ok(rest) = path.strip_prefix("~") else {
+        return Cow::Borrowed(path);
+    };
+    match home() {
+        Some(home) if rest.as_os_str().is_empty() => Cow::Owned(home),
+        Some(home) => Cow::Owned(home.join(rest)),
+        None => Cow::Borrowed(path),
+    }
+}
+
+/// The current user's home directory: `HOME`, then — on Windows, where it is
+/// the native variable and `HOME` is only set by Unix-style shells —
+/// `USERPROFILE`. An empty value counts as unset.
+fn home_dir() -> Option<PathBuf> {
+    let candidates: &[&str] = if cfg!(windows) {
+        &["HOME", "USERPROFILE"]
+    } else {
+        &["HOME"]
+    };
+    candidates
+        .iter()
+        .filter_map(std::env::var_os)
+        .find(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Opens the TCP connection to the bastion, honouring the connect timeout.
@@ -1096,5 +1136,41 @@ async fn shutdown(handle: &Handle<ClientHandler>) {
         .is_err()
     {
         log::debug!("timed out while closing the ssh tunnel");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_leading_tilde_expands_to_the_home_directory() {
+        let home = || Some(PathBuf::from("/home/alice"));
+        let expanded = |path: &str| expand_home(Path::new(path), home).into_owned();
+        assert_eq!(
+            expanded("~/.ssh/id_ed25519"),
+            Path::new("/home/alice/.ssh/id_ed25519")
+        );
+        assert_eq!(expanded("~"), Path::new("/home/alice"));
+        assert_eq!(expanded("~/"), Path::new("/home/alice"));
+        // Not ours to expand: another user's home, a tilde past the start, and
+        // paths with no tilde at all.
+        for untouched in [
+            "~bob/.ssh/id_rsa",
+            "~~/key",
+            "keys/~/id",
+            "/etc/ssh/key",
+            "id",
+        ] {
+            assert_eq!(expanded(untouched), Path::new(untouched));
+        }
+        // No home to expand to: the path is passed through as written.
+        assert_eq!(
+            expand_home(Path::new("~/.ssh/id"), || None),
+            Path::new("~/.ssh/id")
+        );
+        // The home directory is only looked up when it is needed.
+        let path = expand_home(Path::new("/abs/key"), || unreachable!());
+        assert!(matches!(path, Cow::Borrowed(_)));
     }
 }

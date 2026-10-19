@@ -36,7 +36,7 @@
 //! export RUDBKIT_SSH_TEST_PASSWORD=...               # one of these two; without
 //! export RUDBKIT_SSH_TEST_KEY=~/.ssh/id_ed25519      # either, the agent is used
 //! export RUDBKIT_SSH_TEST_KEY_PASSPHRASE=...         # optional, for an encrypted key
-//! export RUDBKIT_SSH_TEST_REMOTE_HOST=db.internal    # optional, defaults to localhost
+//! export RUDBKIT_SSH_TEST_REMOTE_HOST=db.internal    # optional, defaults to 127.0.0.1
 //! export RUDBKIT_SSH_TEST_REMOTE_PORT=22             # optional, defaults to 22
 //!
 //! cargo test -p rudbkit-ssh --test e2e -- --ignored --nocapture
