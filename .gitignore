@@ -1,1 +1,5 @@
 /target/
+
+# graft/trail local data — not committed.
+/graft/
+/.trail/
