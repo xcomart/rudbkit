@@ -551,6 +551,10 @@ fn create(
 
     // Resolve the selected library without changing process-global JAVA_HOME.
     let library = java_home.as_ref().and_then(|home| jvm_library(home));
+    #[cfg(windows)]
+    if let (Some(home), Some(_)) = (&java_home, &library) {
+        add_runtime_bin_to_dll_search(&home.join("bin"));
+    }
     let vm = match library {
         Some(path) => JavaVM::with_libjvm(args, || Ok(path)),
         None => JavaVM::new(args),
@@ -590,6 +594,41 @@ fn create(
             call_method,
         })
     })
+}
+
+/// Puts the runtime's `bin` directory on the DLL search path, which `java.exe`
+/// gets for free by living in it.
+///
+/// The JDK loads some of its own DLLs by bare name. The one that bites is
+/// `zip.dll`: jimage.dll fetches its inflater with `LoadLibrary("zip.dll")` to
+/// read the classes of a `--compress=2` jlink image, which is what the apps
+/// bundle. From an executable outside `bin` that lookup fails, jimage keeps a
+/// null inflater and calls it anyway, and the VM dies with an access violation
+/// at pc 0 while loading its first classes, taking the process with it before
+/// any error can be reported. The same search also finds the MSVC runtime the
+/// JDK ships in `bin` for `jvm.dll`'s own imports. jpackage's Windows launcher
+/// does the same.
+///
+/// Process-wide and never undone: the VM lives as long as the process does.
+#[cfg(windows)]
+fn add_runtime_bin_to_dll_search(bin: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetDllDirectoryW(path: *const u16) -> i32;
+    }
+
+    let wide: Vec<u16> = bin.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call,
+    // and the function copies it.
+    if unsafe { SetDllDirectoryW(wide.as_ptr()) } == 0 {
+        log::warn!(
+            "cannot add {} to the DLL search path: {}",
+            bin.display(),
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -710,5 +749,25 @@ mod tests {
             ]
         );
         assert!(!is_java_home(Path::new("/definitely/missing/runtime")));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn the_runtime_bin_joins_the_dll_search_path() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetDllDirectoryW(length: u32, buffer: *mut u16) -> u32;
+            fn SetDllDirectoryW(path: *const u16) -> i32;
+        }
+        let bin = Path::new(r"C:\rudbkit-test\runtime\bin");
+        add_runtime_bin_to_dll_search(bin);
+        let mut buffer = [0u16; 260];
+        // SAFETY: the length passed is the buffer's own.
+        let length = unsafe { GetDllDirectoryW(buffer.len() as u32, buffer.as_mut_ptr()) };
+        // SAFETY: null restores the default search order.
+        unsafe { SetDllDirectoryW(std::ptr::null()) };
+        assert_eq!(
+            String::from_utf16_lossy(&buffer[..length as usize]),
+            r"C:\rudbkit-test\runtime\bin"
+        );
     }
 }
