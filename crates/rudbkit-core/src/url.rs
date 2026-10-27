@@ -9,14 +9,6 @@ use std::collections::HashMap;
 /// the template happens to use.
 pub const CATALOG_PLACEHOLDERS: [&str; 4] = ["database", "service", "sid", "file"];
 
-/// The British spelling [`CATALOG_PLACEHOLDERS`] had until it moved to US
-/// spelling.
-///
-/// Kept only while the applications' published `dev` branches still use it;
-/// remove it once they have all moved to [`CATALOG_PLACEHOLDERS`].
-#[deprecated(note = "renamed to `CATALOG_PLACEHOLDERS`")]
-pub const CATALOGUE_PLACEHOLDERS: [&str; 4] = CATALOG_PLACEHOLDERS;
-
 /// Fills `{placeholder}` holes in a driver's URL template.
 ///
 /// An unknown placeholder is left as it stands rather than blanked: a template
