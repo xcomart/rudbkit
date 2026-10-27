@@ -45,7 +45,7 @@ In PowerShell, set `$env:RUSTDOCFLAGS = '-D warnings'` before the `cargo doc`
 command. See [CI](.github/workflows/ci.yml) for the current platform matrix.
 
 CI also runs [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) against
-[`deny.toml`](deny.toml). Licence, ban and source checks block; advisories are
+[`deny.toml`](deny.toml). License, ban and source checks block; advisories are
 reported in a separate non-blocking job. When changing dependencies, run:
 
 ```sh

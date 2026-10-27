@@ -66,7 +66,7 @@ fn stalled_bastion() -> (TcpListener, TunnelSpec) {
 /// Runs a tunnel to completion and returns every event it produced.
 ///
 /// A watchdog closes the tunnel once `limit` elapses, so the test can never
-/// hang: the worker thread honours a close even while it is still connecting.
+/// hang: the worker thread honors a close even while it is still connecting.
 fn run_tunnel(spec: TunnelSpec, limit: Duration) -> (u16, Vec<TunnelEvent>) {
     let (tunnel, events) = SshTunnel::open(spec, Arc::new(AcceptAllVerifier));
     let local_port = tunnel.local_port();

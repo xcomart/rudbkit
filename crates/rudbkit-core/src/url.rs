@@ -1,13 +1,21 @@
 //! JDBC URL templates and tunnel redirection.
 use std::collections::HashMap;
 
-/// Placeholders that name the catalogue rather than the server.
+/// Placeholders that name the catalog rather than the server.
 ///
 /// `{database}`, `{service}`, `{sid}` and `{file}` all stand for the same thing
 /// on screen — what a product calls the thing you connect *to* — but each driver
 /// family spells it its own way, so one field on screen fills whichever of these
 /// the template happens to use.
-pub const CATALOGUE_PLACEHOLDERS: [&str; 4] = ["database", "service", "sid", "file"];
+pub const CATALOG_PLACEHOLDERS: [&str; 4] = ["database", "service", "sid", "file"];
+
+/// The British spelling [`CATALOG_PLACEHOLDERS`] had until it moved to US
+/// spelling.
+///
+/// Kept only while the applications' published `dev` branches still use it;
+/// remove it once they have all moved to [`CATALOG_PLACEHOLDERS`].
+#[deprecated(note = "renamed to `CATALOG_PLACEHOLDERS`")]
+pub const CATALOGUE_PLACEHOLDERS: [&str; 4] = CATALOG_PLACEHOLDERS;
 
 /// Fills `{placeholder}` holes in a driver's URL template.
 ///
@@ -95,7 +103,7 @@ pub fn decompose(template: &str, url: &str) -> Option<Vec<(String, String)>> {
     (rest_url == rest_template).then_some(values)
 }
 
-/// A tunnelled URL that names no server the tunnel could stand in for.
+/// A tunneled URL that names no server the tunnel could stand in for.
 ///
 /// Returned by [`redirect_url`] instead of the URL itself: a profile that asked
 /// for an SSH tunnel and then connected straight to the database would reach
@@ -138,7 +146,7 @@ impl std::error::Error for RedirectError {}
 ///
 /// A URL that neither fits — SQLite's `jdbc:sqlite:/path`, H2's `jdbc:h2:mem:x`,
 /// an overridden Oracle descriptor — is a [`RedirectError`], never the URL
-/// unchanged: a tunnelled profile must not connect around its tunnel.
+/// unchanged: a tunneled profile must not connect around its tunnel.
 pub fn redirect_url(
     url: &str,
     template: &str,
@@ -177,7 +185,7 @@ fn rewrite_authority(url: &str, host: &str, port: u16) -> Option<String> {
 ///
 /// Only the authority — the `host:port` between `//` and the next `/`, `;`, `?`
 /// or end — is touched. A URL with no `//` comes back **unchanged**, which for a
-/// tunnelled profile means connecting straight to the database, around the
+/// tunneled profile means connecting straight to the database, around the
 /// tunnel; [`redirect_url`] refuses such a URL instead and also handles
 /// templates with no `//`.
 #[deprecated(
@@ -389,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tunnelled_url_with_no_server_in_it_is_refused_not_passed_through() {
+    fn a_tunneled_url_with_no_server_in_it_is_refused_not_passed_through() {
         for (url, template) in [
             ("jdbc:h2:mem:test", "jdbc:h2:mem:{database}"),
             ("jdbc:sqlite:/var/db/app.sqlite", "jdbc:sqlite:{file}"),

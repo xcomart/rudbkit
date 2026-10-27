@@ -53,7 +53,7 @@ pub struct RuntimeIdentity {
 /// The process-wide VM, once started.
 static JVM: OnceLock<Jvm> = OnceLock::new();
 
-/// Serialises start-up so two threads racing into [`Jvm::start`] cannot both
+/// Serializes start-up so two threads racing into [`Jvm::start`] cannot both
 /// try to create a VM. `OnceLock::get_or_init` cannot do this on its own
 /// because building the VM is fallible and a failure must not poison the slot.
 static STARTING: Mutex<()> = Mutex::new(());
@@ -199,7 +199,7 @@ struct LocaleParts {
 /// region.
 ///
 /// The grammar is RFC 5646's `language [-extlang] [-script] [-region]`, read
-/// left to right with each optional subtag recognised by its shape: a script is
+/// left to right with each optional subtag recognized by its shape: a script is
 /// four letters, a region two letters or three digits. Extended language
 /// subtags, variants, extensions and private use are dropped — Java's
 /// `user.variant` takes its own non-BCP 47 syntax, and none of them changes
@@ -444,7 +444,7 @@ impl Jvm {
     /// and detaching around it.
     ///
     /// Only `CANCEL` takes this path. It has to run while the session worker is
-    /// blocked inside the very statement it is cancelling, so it cannot be
+    /// blocked inside the very statement it is canceling, so it cannot be
     /// queued behind it, and it is rare enough that the cost of an attach does
     /// not matter (architecture document, §4.2).
     pub fn call_detached(
