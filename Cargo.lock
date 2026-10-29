@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "rudbkit-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "log",
  "serde",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "rudbkit-jdbc"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "jni",
  "log",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "rudbkit-ssh"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "futures",

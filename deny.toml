@@ -1,9 +1,9 @@
 # What `cargo deny check` (the `deny` jobs in .github/workflows/ci.yml)
 # accepts in the dependency graph. Advisories are checked in their own,
-# non-blocking job; licences, bans and sources block.
+# non-blocking job; licenses, bans and sources block.
 
 [graph]
-# Optional features count: a licence or source that only arrives behind a
+# Optional features count: a license or source that only arrives behind a
 # feature still ends up in someone's build.
 all-features = true
 

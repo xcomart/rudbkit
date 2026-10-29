@@ -16,7 +16,7 @@
 //! * The host key is a checked-in throwaway rather than a generated one, which
 //!   keeps a random number generator out of the dependency tree. It is a test
 //!   fixture and guards nothing.
-//! * Nothing here sleeps to synchronise. Progress is observed by waiting for
+//! * Nothing here sleeps to synchronize. Progress is observed by waiting for
 //!   events, and every wait is bounded by [`EVENT_TIMEOUT`]; on expiry the panic
 //!   message lists every event seen so far.
 //! * The tunnel runs on its own thread with its own runtime (see

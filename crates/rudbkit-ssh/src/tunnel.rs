@@ -750,7 +750,7 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Opens the TCP connection to the bastion, honouring the connect timeout.
+/// Opens the TCP connection to the bastion, honoring the connect timeout.
 async fn tcp_connect(spec: &TunnelSpec) -> Result<TcpStream, Failure> {
     let address = (spec.host.as_str(), spec.port);
     let attempt = TcpStream::connect(address);
