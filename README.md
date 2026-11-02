@@ -45,6 +45,15 @@ Connection saving validates before any write, persists the profile, then writes
 secrets. A secret-store failure can leave the profile on disk; the application
 keeps its form open and retries, and connects only after the current save succeeds.
 
+## AI-assisted development
+
+Parts of the code in this repository were generated with AI coding agents. That
+code is held to the same tests and CI checks as code written by hand, and the
+maintainers are responsible for it in the same way. If you use an agent to
+contribute, first read
+[Using AI coding agents](CONTRIBUTING.md#using-ai-coding-agents) in the
+contribution guide.
+
 ## Contributing
 
 See the [contribution guide](CONTRIBUTING.md) for development setup, shared API
