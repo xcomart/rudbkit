@@ -147,6 +147,44 @@ rudbkit entries in each consumer's root manifest to the same Git commit,
 regenerate its lockfile and rerun its checks. Include intentional manifest and
 lockfile changes together in that consumer's contribution.
 
+## Using AI coding agents
+
+Parts of rudbkit were generated with AI coding agents, and a contribution made
+with one is welcome on the same terms as any other. You are its author: read
+every line before submitting it and be ready to explain it in review. An agent
+does the typing; it does not take the responsibility.
+
+Start the agent from a checkout of `dev` and point it at this guide and the
+[README](README.md), so that it works from the contracts listed in
+[Where changes belong](#where-changes-belong) and the checks above rather than
+from guesses. Ask for one focused change at a time and let it stop at a local
+commit you review. Pushing, opening or merging pull requests, moving tags and
+publishing releases stay with a person.
+
+- **Run the checks yourself.** An agent's report that the tests pass is not
+  validation. Run the commands in
+  [Development environment](#development-environment), then the consumer checks
+  in [Tests and consumer validation](#tests-and-consumer-validation). Passing
+  here does not show that rudbgen and rudbman still work.
+- **Read security-sensitive changes line by line.** Authentication, host-key
+  verification, forwarding and tunnel ownership are where a plausible-looking
+  simplification turns into a hole. An agent must not relax host-key checks,
+  bind a forward beyond loopback or release a lease it does not own to make a
+  test pass.
+- **Keep the shared layer application-neutral.** Agents readily add an
+  application name, a settings path or a bridge protocol detail here. Those
+  come from the consumer through adapters.
+- **Keep secrets away from the agent.** Most agents send what they read to a
+  remote service. Do not give one your SSH keys, passwords, keychain entries,
+  real bastion details or the `RUDBKIT_SSH_TEST_*` values for a real server.
+  The loopback servers and generated keys the tests use are enough.
+- **Review the diff for what agents tend to get wrong:** edits outside the task,
+  reworded comments and reformatted code it had no reason to touch, tests
+  deleted, weakened or marked `#[ignore]` to reach a green run, invented APIs,
+  new dependencies, and a fix made in one platform's code but not in its
+  Windows, macOS or Linux counterpart. A new dependency needs the same
+  discussion as any other, and `cargo deny --locked check` must still pass.
+
 ## Submit your contribution
 
 Use `cargo fmt --all`, follow the surrounding style, document public APIs and
