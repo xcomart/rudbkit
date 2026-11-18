@@ -17,6 +17,10 @@ ignore = [
     # operations; the SSH client signs with an RSA key once per authentication,
     # on the user's own machine, which gives a remote party nothing to measure.
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; one client-side RSA signature per SSH login is not a usable timing oracle" },
+    # `chrono` is soft-deprecated by its maintainer in favour of `jiff`, with no
+    # advisory against its behavior. russh takes it through `russh-util`; it
+    # leaves when russh moves off it.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained (soft-deprecated for jiff), pulled in by russh via russh-util; no replacement upstream" },
 ]
 
 [licenses]
