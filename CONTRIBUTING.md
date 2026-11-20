@@ -57,7 +57,7 @@ cargo deny --locked check advisories
 
 | Crate | Responsibility |
 | --- | --- |
-| `rudbkit-core` | SSH profile serialization, JDBC URL templates and redirection, connection validation and ordered profile/secret saving |
+| `rudbkit-core` | SSH profile serialization, JDBC URL templates and redirection, connection validation, ordered profile/secret saving, and the products the applications ship a driver definition for |
 | `rudbkit-ssh` | Authentication, host-key verification, forwarding and generation-owned tunnel leases |
 | `rudbkit-jdbc` | Runtime discovery, JVM configuration/startup and JNI access to an application-supplied bridge class |
 
@@ -76,6 +76,10 @@ contracts when changing behavior:
   Runtime discovery does not mutate the process environment.
 - Keep the russh `ring` backend and disabled default features used by the
   workspace, so consumers do not acquire extra Windows build requirements.
+- `products` holds what belongs to a database product, not what an
+  application chooses for it: no ids, icons or driver versions. A product
+  added here reaches an application only when that application lists it, so
+  adding one changes neither until they move to the new commit.
 
 ## Tests and consumer validation
 
