@@ -5,7 +5,7 @@ and [rudbman](https://github.com/xcomart/rudbman). It has no GUI dependency.
 
 | Crate | Responsibility |
 | --- | --- |
-| `rudbkit-core` | Compatible SSH profile serialization, JDBC URL templates and tunnel redirection, connection validation and ordered profile/secret saving. |
+| `rudbkit-core` | Compatible SSH profile serialization, JDBC URL templates and tunnel redirection, connection validation, ordered profile/secret saving, and the database products both applications ship a driver definition for. |
 | `rudbkit-ssh` | SSH authentication, host-key verification, local forwarding and a pool whose leases own a specific connection generation. |
 | `rudbkit-jdbc` | JVM options, bundled runtime discovery, process-wide startup and JNI calls to an application-supplied bridge class. |
 
