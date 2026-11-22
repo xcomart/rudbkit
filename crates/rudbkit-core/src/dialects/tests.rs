@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::de::IgnoredAny;
 
@@ -203,6 +203,32 @@ fn a_bridge_mistake_says_where() {
 fn a_profile_writes_only_what_it_holds() {
     let file: ProfileFile<()> = ProfileFile::new("Bare", "postgres");
     assert_eq!(to_yaml(&file), "api: 1\nname: Bare\nbase: postgres\n");
+}
+
+/// An icon is a file when it looks like one, from the profiles' folder when
+/// relative, and otherwise the name of a mark.
+#[test]
+fn an_icon_is_a_mark_or_a_file() {
+    let base = Path::new("/config/dialects");
+    assert_eq!(icon_ref("mysql", base), IconRef::Mark("mysql"));
+    assert_eq!(icon_ref(" tidb ", base), IconRef::Mark("tidb"));
+    assert_eq!(
+        icon_ref("logo.PNG", base),
+        IconRef::File(base.join("logo.PNG"))
+    );
+    assert_eq!(
+        icon_ref("icons/acme.svg", base),
+        IconRef::File(base.join("icons/acme.svg"))
+    );
+    assert_eq!(
+        icon_ref("/opt/acme/logo.webp", base),
+        IconRef::File(PathBuf::from("/opt/acme/logo.webp"))
+    );
+    assert_eq!(
+        icon_ref("acme/logo", base),
+        IconRef::File(base.join("acme/logo")),
+        "a path without an extension is still a path"
+    );
 }
 
 /// A built-in is found by its name or an alias, in any case.

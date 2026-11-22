@@ -22,6 +22,7 @@
 //! both applications bring the same ones.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -140,7 +141,8 @@ pub struct ProfileDriver {
     /// The port the connection editor fills in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_port: Option<u16>,
-    /// The icon, an asset stem such as `mysql`.
+    /// The icon: the name of a mark the applications ship, such as `mysql`,
+    /// or an image file of the user's — see [`icon_ref`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 }
@@ -149,6 +151,46 @@ impl ProfileDriver {
     /// The definition's name: the section's, or else `profile_name`.
     pub fn name_or<'a>(&'a self, profile_name: &'a str) -> &'a str {
         self.name.as_deref().unwrap_or(profile_name)
+    }
+}
+
+/// What a driver definition's `icon` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IconRef<'a> {
+    /// A mark the application ships, by its name: `mysql`, `tidb`.
+    Mark(&'a str),
+    /// An image file.
+    File(PathBuf),
+}
+
+/// The image file extensions [`icon_ref`] takes for a file: the raster
+/// formats gpui decodes, and SVG.
+pub const ICON_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp", "ico", "svg"];
+
+/// A driver definition's `icon` read the way both applications read it.
+///
+/// One that holds a `/` or a `\\`, or ends in one of [`ICON_EXTENSIONS`], is a
+/// file — taken from `base`, the profiles' folder, when it is relative, so
+/// that a profile's image can sit beside it the way its script does. Anything
+/// else is the name of a mark the application ships. Whether the file is there
+/// and is an image is the application's to find out, and one that is not falls
+/// back as a name the application does not know does.
+pub fn icon_ref<'a>(icon: &'a str, base: &Path) -> IconRef<'a> {
+    let icon = icon.trim();
+    let extension = Path::new(icon)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let is_file = icon.contains(['/', '\\'])
+        || extension.is_some_and(|extension| ICON_EXTENSIONS.contains(&extension.as_str()));
+    if !is_file {
+        return IconRef::Mark(icon);
+    }
+    let path = Path::new(icon);
+    if path.is_absolute() {
+        IconRef::File(path.to_path_buf())
+    } else {
+        IconRef::File(base.join(path))
     }
 }
 

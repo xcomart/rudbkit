@@ -17,6 +17,12 @@ and the format is §4.
 
 What each rests on, and what its product does not do, is §12.1.
 
+A profile's `driver.icon` names a mark the applications ship (`tidb`,
+`mysql`, …) or an image file — PNG, JPEG, WebP, GIF, BMP, ICO or SVG, by an
+absolute path or one relative to the profiles' folder, beside the profile.
+Each application draws it beside the driver, resampled to its size, and falls
+back to the dialect's mark when the file cannot be read (`icon_ref`).
+
 rudbman reads every part of a profile. rudbgen reads its `driver` section and,
 of its `bridge` half, what its own bridge answers — `detect`,
 `catalog_is_schema` and `comments`; it runs no script.
