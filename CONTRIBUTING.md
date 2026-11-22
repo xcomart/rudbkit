@@ -57,7 +57,7 @@ cargo deny --locked check advisories
 
 | Crate | Responsibility |
 | --- | --- |
-| `rudbkit-core` | SSH profile serialization, JDBC URL templates and redirection, connection validation, ordered profile/secret saving, and the products the applications ship a driver definition for |
+| `rudbkit-core` | SSH profile serialization, JDBC URL templates and redirection, connection validation, ordered profile/secret saving, the products the applications ship a driver definition for, and the dialect profiles both read and ship |
 | `rudbkit-ssh` | Authentication, host-key verification, forwarding and generation-owned tunnel leases |
 | `rudbkit-jdbc` | Runtime discovery, JVM configuration/startup and JNI access to an application-supplied bridge class |
 
@@ -80,6 +80,12 @@ contracts when changing behavior:
   application chooses for it: no ids, icons or driver versions. A product
   added here reaches an application only when that application lists it, so
   adding one changes neither until they move to the new commit.
+- `dialects` is the profile format both applications read, fixed by rudbman's
+  `docs/dialect-profiles.md`, and `dialects/` the profiles they ship. A
+  profile stays readable by both: rudbgen reads the `sql` half without
+  checking it and ignores scripts. `BUILT_IN` is rudbman's built-in dialects,
+  which rudbman's tests hold it to. A changed or added profile reaches the
+  applications only when they move to the new commit.
 
 ## Tests and consumer validation
 

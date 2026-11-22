@@ -1,0 +1,122 @@
+# Firebird, which no built-in speaks: a profile on generic SQL, its catalog
+# read from the RDB$ system tables, and what data cannot say - a trigger's
+# type code, a sequence's value - in firebird.groovy.
+#
+# Firebird 3 and later: BOOLEAN, identity columns, OFFSET ... FETCH. A
+# database has no catalogs or schemas; every name is a table's own.
+api: 1
+name: Firebird
+base: generic
+sql:
+  syntax:
+    hash_line_comment: false
+    dash_dash_needs_space: false
+    nested_block_comments: false
+    backslash_escapes: false
+    e_strings: false
+    double_quoted_strings: false
+    backtick_identifiers: false
+    bracket_identifiers: false
+    dollar_quotes: false
+    hex_literals: true
+    numbered_parameters: false
+    colon_parameters: true
+    at_parameters: false
+    hash_identifiers: false
+  words:
+    keywords: [ACTIVE, INACTIVE, POSITION, RECREATE, SUSPEND, MATCHING, RETURNING, GENERATOR, GEN_ID, SEQUENCE, RESTART, ROWS, SKIP, FIRST, BLOCK, TERM, VARIABLE, DOMAIN, EXCEPTION, PACKAGE]
+    types: [BLOB, INT128, DECFLOAT, BOOLEAN]
+  functions: [GEN_ID, IIF, LIST, DATEADD, DATEDIFF, LPAD, RPAD, ROUND, TRUNC, CHAR_LENGTH, OCTET_LENGTH, POSITION, REPLACE, REVERSE, UUID_TO_CHAR, GEN_UUID, HASH]
+  folding: upper
+  case_insensitive_names: false
+  catalog_first: false
+  uses_catalogs: false
+  blocks:
+    language: plsql
+  routine_layout: other
+  client: plain
+  page_clause: "OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+  explain: null
+  empty_insert: "INSERT INTO {table} DEFAULT VALUES"
+  alter:
+    add: ADD
+    drop: DROP
+    retype: TYPE
+    default_first: true
+    named_reference_columns: false
+    column_rename: alter_to
+    attrs: clauses
+    constraints: named
+    table_rename: none
+    reorg: false
+  unsupported_reasons:
+    table_rename: "Firebird has no statement that renames a table; it has to be created again under the new name and its rows copied over"
+  drops:
+    schema: none
+    database: false
+    truncate: delete_all
+    routines: named
+    triggers: named
+    in_catalog: false
+  enter_scope: null
+  connect_timeout_property: null
+bridge:
+  detect: [firebird]
+  # Every user sequence; an identity column's own is the system's.
+  sequences:
+    - >-
+      SELECT CAST(NULL AS VARCHAR(1)) AS SEQUENCE_CATALOG, CAST(NULL AS VARCHAR(1)) AS SEQUENCE_SCHEMA,
+      TRIM(RDB$GENERATOR_NAME) AS SEQUENCE_NAME, 'BIGINT' AS DATA_TYPE,
+      RDB$INITIAL_VALUE AS START_VALUE, RDB$GENERATOR_INCREMENT AS INCREMENT,
+      RDB$DESCRIPTION AS REMARKS
+      FROM RDB$GENERATORS WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0
+  # The trigger's type code goes in the timing column, for the script's
+  # triggerRow to read as timing and events.
+  triggers:
+    sql: >-
+      SELECT CAST(NULL AS VARCHAR(1)), CAST(NULL AS VARCHAR(1)), TRIM(RDB$TRIGGER_NAME),
+      TRIM(RDB$RELATION_NAME), CAST(RDB$TRIGGER_TYPE AS VARCHAR(12)), CAST(NULL AS VARCHAR(1)),
+      'ROW', CASE RDB$TRIGGER_INACTIVE WHEN 1 THEN 'N' ELSE 'Y' END, RDB$DESCRIPTION
+      FROM RDB$TRIGGERS WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0 AND RDB$RELATION_NAME IS NOT NULL
+    filters: { name: RDB$TRIGGER_NAME }
+    order_by: "3"
+  texts:
+    table: null
+    view:
+      sql: >-
+        SELECT 'CREATE VIEW {qualified} AS ' || RDB$VIEW_SOURCE
+        FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ?
+      binds: [name]
+    trigger:
+      sql: >-
+        SELECT 'CREATE TRIGGER {qualified} FOR "' || TRIM(RDB$RELATION_NAME) || '" '
+        || CASE RDB$TRIGGER_INACTIVE WHEN 1 THEN 'INACTIVE ' ELSE 'ACTIVE ' END
+        || CASE RDB$TRIGGER_TYPE
+             WHEN 1 THEN 'BEFORE INSERT' WHEN 2 THEN 'AFTER INSERT'
+             WHEN 3 THEN 'BEFORE UPDATE' WHEN 4 THEN 'AFTER UPDATE'
+             WHEN 5 THEN 'BEFORE DELETE' WHEN 6 THEN 'AFTER DELETE'
+             WHEN 17 THEN 'BEFORE INSERT OR UPDATE' WHEN 18 THEN 'AFTER INSERT OR UPDATE'
+             WHEN 25 THEN 'BEFORE INSERT OR DELETE' WHEN 26 THEN 'AFTER INSERT OR DELETE'
+             WHEN 27 THEN 'BEFORE UPDATE OR DELETE' WHEN 28 THEN 'AFTER UPDATE OR DELETE'
+             WHEN 113 THEN 'BEFORE INSERT OR UPDATE OR DELETE'
+             WHEN 114 THEN 'AFTER INSERT OR UPDATE OR DELETE' END
+        || ' POSITION ' || RDB$TRIGGER_SEQUENCE || ' ' || RDB$TRIGGER_SOURCE
+        FROM RDB$TRIGGERS WHERE RDB$TRIGGER_NAME = ?
+      binds: [name]
+    sequence:
+      sql: >-
+        SELECT 'CREATE SEQUENCE {qualified} START WITH ' || RDB$INITIAL_VALUE
+        || ' INCREMENT BY ' || RDB$GENERATOR_INCREMENT
+        FROM RDB$GENERATORS WHERE RDB$GENERATOR_NAME = ?
+      binds: [name]
+  types_sequences: false
+  multi_row_values: false
+  drop_foreign_key: "ALTER TABLE {table} DROP CONSTRAINT {key};"
+  script: firebird.groovy
+driver:
+  class: org.firebirdsql.jdbc.FBDriver
+  maven: org.firebirdsql.jdbc:jaybird:6.0.7
+  # Without a connection character set Jaybird talks NONE, and text outside
+  # ASCII arrives as question marks.
+  url_template: "jdbc:firebird://{host}:{port}/{database}?encoding=UTF8"
+  default_port: 3050

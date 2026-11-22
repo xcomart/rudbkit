@@ -18,3 +18,11 @@ russh = { version = "0.65", default-features = false, features = ["ring", "flate
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 jni = { version = "0.22", features = ["invocation"] }
 thiserror = "2"
+# The dialect profiles (`rudbkit-core`'s `dialects`). Both applications already
+# take each: `anyhow` for their errors; `serde_norway`, the maintained
+# `serde_yaml` fork rugpui picked, for YAML; `sha2` for the hashes the
+# shipped-file record and the allow list keep.
+anyhow = "1"
+serde_norway = "0.9"
+sha2 = "0.11"
+tempfile = "3"

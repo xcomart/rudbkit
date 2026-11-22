@@ -1,0 +1,32 @@
+# CockroachDB: PostgreSQL's wire protocol and most of its grammar, so
+# PostgreSQL's dialect. Its server calls itself PostgreSQL to a driver, so a
+# session finds this profile through its driver definition.
+api: 1
+name: CockroachDB
+base: postgres
+sql:
+  words:
+    keywords: [INTERLEAVE, SPLIT, SCATTER, EXPERIMENTAL, CHANGEFEED, ZONE, SURVIVE, REGIONAL, GLOBAL, UPSERT]
+    types: [STRING, BYTES, INT2, INT4, INT8, FLOAT4, FLOAT8]
+  functions: [UNIQUE_ROWID, GEN_RANDOM_UUID, CRDB_INTERNAL]
+  alter:
+    # A unique constraint is its index, which ALTER TABLE ... DROP CONSTRAINT
+    # will not take away (cockroachdb/cockroach#42840).
+    unique_drop: "DROP INDEX {table}@{constraint} CASCADE"
+bridge:
+  # No pg_get_triggerdef: a trigger's own text is in a crdb_internal table.
+  texts:
+    # The catalog types a sequence by its type's OID, which a CREATE does
+    # not take; the server writes the statement itself.
+    sequence: { sql: "SHOW CREATE SEQUENCE {qualified}", column: 2 }
+    trigger:
+      sql: >-
+        SELECT create_statement FROM crdb_internal.create_trigger_statements
+        WHERE database_name = current_database() AND schema_name = ? AND trigger_name = ?
+      binds: [schema, name]
+driver:
+  class: org.postgresql.Driver
+  maven: org.postgresql:postgresql:42.7.4
+  url_template: "jdbc:postgresql://{host}:{port}/{database}"
+  default_port: 26257
+  icon: postgresql

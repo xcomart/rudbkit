@@ -1,0 +1,33 @@
+# TiDB, PingCAP's distributed database: MySQL's wire protocol and grammar,
+# so MySQL's dialect, with what TiDB adds to it and less what it leaves out.
+# Its server calls itself MySQL to a driver, so a session finds this profile
+# through its driver definition rather than by product name.
+api: 1
+name: TiDB
+base: mysql
+sql:
+  words:
+    keywords: [AUTO_RANDOM, SHARD_ROW_ID_BITS, PRE_SPLIT_REGIONS, PLACEMENT, POLICY, TIFLASH, NONCLUSTERED, CLUSTERED]
+  functions: [TIDB_VERSION, TIDB_PARSE_TSO, TIDB_DECODE_KEY, TIDB_ROW_CHECKSUM]
+bridge:
+  # No triggers, no stored routines: TiDB has neither.
+  triggers: null
+  # Sequences, which MySQL has none of, in information_schema.SEQUENCES: the
+  # database is the catalog, as everywhere in the MySQL family.
+  sequences:
+    - >-
+      SELECT SEQUENCE_SCHEMA AS SEQUENCE_CATALOG, NULL AS SEQUENCE_SCHEMA, SEQUENCE_NAME,
+      'bigint' AS DATA_TYPE, START AS START_VALUE, MIN_VALUE AS MINIMUM_VALUE,
+      MAX_VALUE AS MAXIMUM_VALUE, INCREMENT,
+      CASE CYCLE WHEN 1 THEN 'YES' ELSE 'NO' END AS CYCLE_OPTION,
+      CACHE_VALUE AS CACHE, COMMENT AS REMARKS
+      FROM information_schema.SEQUENCES
+  texts:
+    sequence: { sql: "SHOW CREATE SEQUENCE {qualified}", column: 2 }
+  script: tidb.groovy
+driver:
+  class: com.mysql.cj.jdbc.Driver
+  maven: com.mysql:mysql-connector-j:9.1.0
+  url_template: "jdbc:mysql://{host}:{port}/{database}"
+  default_port: 4000
+  icon: mysql
