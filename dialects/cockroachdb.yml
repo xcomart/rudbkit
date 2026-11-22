@@ -29,4 +29,4 @@ driver:
   maven: org.postgresql:postgresql:42.7.4
   url_template: "jdbc:postgresql://{host}:{port}/{database}"
   default_port: 26257
-  icon: postgresql
+  icon: cockroachdb

@@ -120,3 +120,4 @@ driver:
   # ASCII arrives as question marks.
   url_template: "jdbc:firebird://{host}:{port}/{database}?encoding=UTF8"
   default_port: 3050
+  icon: firebird

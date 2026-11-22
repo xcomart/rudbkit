@@ -30,4 +30,4 @@ driver:
   maven: com.mysql:mysql-connector-j:9.1.0
   url_template: "jdbc:mysql://{host}:{port}/{database}"
   default_port: 4000
-  icon: mysql
+  icon: tidb
