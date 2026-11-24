@@ -26,7 +26,7 @@ bridge:
       binds: [schema, name]
 driver:
   class: org.postgresql.Driver
-  maven: org.postgresql:postgresql:42.7.4
+  maven: org.postgresql:postgresql:42.7.15
   url_template: "jdbc:postgresql://{host}:{port}/{database}"
   default_port: 26257
   icon: cockroachdb

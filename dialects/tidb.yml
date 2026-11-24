@@ -27,7 +27,7 @@ bridge:
   script: tidb.groovy
 driver:
   class: com.mysql.cj.jdbc.Driver
-  maven: com.mysql:mysql-connector-j:9.1.0
+  maven: com.mysql:mysql-connector-j:26.10.0
   url_template: "jdbc:mysql://{host}:{port}/{database}"
   default_port: 4000
   icon: tidb

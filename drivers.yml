@@ -1,0 +1,201 @@
+# The built-in driver definitions of rudbman and rudbgen, compiled into
+# rudbkit-core (`builtins`) and, through it, into both applications.
+#
+# `products` says what each product and its usual JDBC driver are, once for
+# both applications, with the keys a dialect profile's `driver` section uses
+# (rudbman's docs/dialect-profiles.md, §4.4) and the dialect id rudbman-sql and
+# the bridges know it by. The key is the id a definition of it takes.
+#
+# `rudbman` and `rudbgen` list each application's built-ins in the order its
+# driver picker shows them. An entry names its product and may give the
+# definition another `id` or `name`; rudbgen's may add what only its
+# definitions carry: `no_auth`, connection `props` and the custom `queries`.
+#
+# A definition is what a new drivers.json starts from, and what an older one
+# is offered once: the user's file is never changed under them. The Maven
+# coordinates pin a driver that was current when they were written; they are a
+# starting point for the downloader, not a requirement. The container suites
+# run against the same versions (each application's bridge/build.gradle).
+#
+# A database product supported from now on is a dialect profile in dialects/,
+# not an entry here.
+
+products:
+  oracle-thin:
+    # Oracle Database by service name; the older SID form is
+    # `@//{host}:{port}:{sid}`.
+    name: Oracle Thin
+    class: oracle.jdbc.OracleDriver
+    maven: com.oracle.database.jdbc:ojdbc11:23.26.4.0.0
+    url_template: "jdbc:oracle:thin:@//{host}:{port}/{service}"
+    default_port: 1521
+    dialect: oracle
+    icon: oracle
+  postgresql:
+    name: PostgreSQL
+    class: org.postgresql.Driver
+    maven: org.postgresql:postgresql:42.7.15
+    url_template: "jdbc:postgresql://{host}:{port}/{database}"
+    default_port: 5432
+    dialect: postgres
+    icon: postgresql
+  mysql:
+    # MySQL, through Connector/J.
+    name: MySQL
+    class: com.mysql.cj.jdbc.Driver
+    maven: com.mysql:mysql-connector-j:26.10.0
+    url_template: "jdbc:mysql://{host}:{port}/{database}"
+    default_port: 3306
+    dialect: mysql
+    icon: mysql
+  mariadb:
+    # Its dialect read as `mysql` until a server disagreed: the fork spells a
+    # check-constraint drop `DROP CONSTRAINT` where MySQL spells it
+    # `DROP CHECK`, and answers a syntax error for MySQL's.
+    name: MariaDB
+    class: org.mariadb.jdbc.Driver
+    maven: org.mariadb.jdbc:mariadb-java-client:4.0.0
+    url_template: "jdbc:mariadb://{host}:{port}/{database}"
+    default_port: 3306
+    dialect: mariadb
+    icon: mariadb
+  sqlite:
+    # A file, not a service: no host, no port.
+    name: SQLite
+    class: org.sqlite.JDBC
+    maven: org.xerial:sqlite-jdbc:3.54.1.0
+    url_template: "jdbc:sqlite:{file}"
+    dialect: sqlite
+    icon: sqlite
+  h2-embedded:
+    # A file opened in this process. It takes an exclusive lock, so the same
+    # database cannot be open in a running H2 server at the time.
+    name: H2 Embedded
+    class: org.h2.Driver
+    maven: com.h2database:h2:2.5.252
+    url_template: "jdbc:h2:{file}"
+    dialect: h2
+    icon: h2
+  h2-server:
+    name: H2 Server
+    class: org.h2.Driver
+    maven: com.h2database:h2:2.5.252
+    url_template: "jdbc:h2:tcp://{host}:{port}/{database}"
+    default_port: 9092
+    dialect: h2
+    icon: h2
+  mssql:
+    # Its URL carries semicolon-separated properties, not a path: that is this
+    # driver's grammar, not a typo.
+    name: Microsoft SQL Server
+    class: com.microsoft.sqlserver.jdbc.SQLServerDriver
+    maven: com.microsoft.sqlserver:mssql-jdbc:13.6.2.jre11
+    url_template: "jdbc:sqlserver://{host}:{port};databaseName={database}"
+    default_port: 1433
+    dialect: mssql
+    icon: mssql
+  mongodb:
+    name: MongoDB
+    class: com.mongodb.jdbc.MongoDriver
+    maven: org.mongodb:mongodb-jdbc:4.0.3
+    url_template: "jdbc:mongodb://{host}:{port}/{database}"
+    default_port: 27017
+    dialect: generic
+    icon: mongodb
+  cubrid:
+    # Colon-separated, and the trailing empty user and password fields are
+    # part of the grammar: `host:port:database:user:password:`.
+    name: CUBRID
+    class: cubrid.jdbc.driver.CUBRIDDriver
+    maven: org.cubrid:cubrid-jdbc:11.3.2.0053
+    url_template: "jdbc:cubrid:{host}:{port}:{database}:::"
+    default_port: 33000
+    dialect: generic
+    icon: cubrid
+  db2:
+    # IBM's JCC, the type 4 driver: the one Maven Central carries, and the
+    # same JAR for Db2 on Linux, UNIX and Windows, z/OS and IBM i. The database
+    # in its URL is the one the server catalogs, not a schema.
+    name: IBM Db2
+    class: com.ibm.db2.jcc.DB2Driver
+    maven: com.ibm.db2:jcc:12.1.5.0
+    url_template: "jdbc:db2://{host}:{port}/{database}"
+    default_port: 50000
+    dialect: db2
+    icon: db2
+
+rudbman:
+  # The server URL, under the product's short name: an embedded H2 file is
+  # opened by editing it into `jdbc:h2:file:/path/to/db`, which the connection
+  # editor allows.
+  - product: h2-server
+    id: h2
+    name: H2
+  - product: postgresql
+  - product: mysql
+  - product: mariadb
+  - product: sqlite
+  - product: oracle-thin
+  - product: mssql
+  - product: db2
+
+# jdbgen's ten stock drivers merged with rudbman's seven, jdbgen's properties
+# and custom queries carried over; Db2 came after and sits last.
+rudbgen:
+  - product: oracle-thin
+    # Without it the thin driver reports no `REMARKS` at all: Oracle's
+    # comments live in `ALL_TAB_COMMENTS`, and this is the switch that makes
+    # the driver read them.
+    props:
+      remarksReporting: "true"
+  - product: postgresql
+  - product: mysql
+    # Connector/J's own `SHOW`-based metadata path answers a truncated
+    # `REMARKS` and no `COLUMN_DEF` for several types; the information schema
+    # answers both.
+    props:
+      useInformationSchema: "true"
+  - product: sqlite
+    no_auth: true
+  - product: h2-embedded
+    no_auth: true
+    queries:
+      tables: &h2-tables
+        # H2 2.x answers `getTables` with the standard's `BASE TABLE` where
+        # every other product says `TABLE`. The `CASE` translates it; the rest
+        # is the five labels the table list requires, quoted to keep them
+        # upper-case.
+        enabled: true
+        sql: |-
+          select TABLE_CATALOG as "TABLE_CAT", TABLE_SCHEMA as "TABLE_SCHEM", TABLE_NAME, CASE WHEN TABLE_TYPE='BASE TABLE' THEN 'TABLE' ELSE TABLE_TYPE END AS "TABLE_TYPE", REMARKS
+          from information_schema.tables
+          where TABLE_CATALOG='${catalog}' and TABLE_SCHEMA='${schema}'
+  - product: h2-server
+    queries:
+      tables: *h2-tables
+  - product: mssql
+    # From 10.2 the driver encrypts by default and then refuses the
+    # self-signed certificate a development server presents, which reads as
+    # "the driver cannot reach the server".
+    props:
+      encrypt: "true"
+      trustServerCertificate: "true"
+    # Extended properties are where SQL Server keeps its comments, and no
+    # version of the driver reports them in `REMARKS`. Both ship switched off:
+    # the bridge asks the same question itself, over the whole schema at once,
+    # and these are where a user whose server disagrees starts from.
+    queries:
+      table_comments:
+        enabled: false
+        sql: |-
+          SELECT OBJNAME, cast(value as varchar(8000)) as VALUE
+          FROM fn_listextendedproperty ('MS_DESCRIPTION','schema','${schema}','table',null,null,null)
+      column_comments:
+        enabled: false
+        sql: |-
+          SELECT OBJNAME, cast(value as varchar(8000)) as VALUE
+          FROM fn_listextendedproperty ('MS_DESCRIPTION','schema','${schema}','table','${table}','column',null)
+  - product: mariadb
+  - product: mongodb
+  - product: cubrid
+  - product: db2
