@@ -55,6 +55,24 @@ List<String> counters(DatabaseMetaData dbm, Ident id, List<Sequence> sequences,
 }
 
 /**
+ * The constraint behind each index, from RDB$RELATION_CONSTRAINTS. A unique
+ * index made by CREATE UNIQUE INDEX enforces none, so it is not offered as a
+ * constraint that DROP CONSTRAINT could drop.
+ */
+Map<String, String> indexConstraints(Connection conn, Ident id, String catalog, String schema,
+        String table) {
+    Map<String, String> out = [:]
+    each(conn, 'SELECT TRIM(RDB$INDEX_NAME), TRIM(RDB$CONSTRAINT_NAME) FROM RDB$RELATION_CONSTRAINTS' +
+            " WHERE RDB\$CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE') AND RDB\$RELATION_NAME = ?",
+            table) { ResultSet rs ->
+        if (rs.getString(1) != null) {
+            out[Vendor.indexKey(null, rs.getString(1))] = rs.getString(2)
+        }
+    }
+    out
+}
+
+/**
  * A routine's own text, which Firebird keeps only as its body: the header -
  * the arguments, what it returns - is put back together from RDB$FIELDS,
  * by the types the database holds them as.
