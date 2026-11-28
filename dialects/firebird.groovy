@@ -57,13 +57,18 @@ List<String> counters(DatabaseMetaData dbm, Ident id, List<Sequence> sequences,
 /**
  * The constraint behind each index, from RDB$RELATION_CONSTRAINTS. A unique
  * index made by CREATE UNIQUE INDEX enforces none, so it is not offered as a
- * constraint that DROP CONSTRAINT could drop.
+ * constraint that DROP CONSTRAINT could drop. Firebird makes an index for
+ * every foreign key, which it will not drop while the key stands, so those
+ * are answered too - first, so that an index a key and a reference share goes
+ * by the key.
  */
 Map<String, String> indexConstraints(Connection conn, Ident id, String catalog, String schema,
         String table) {
     Map<String, String> out = [:]
     each(conn, 'SELECT TRIM(RDB$INDEX_NAME), TRIM(RDB$CONSTRAINT_NAME) FROM RDB$RELATION_CONSTRAINTS' +
-            " WHERE RDB\$CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE') AND RDB\$RELATION_NAME = ?",
+            " WHERE RDB\$CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY')" +
+            ' AND RDB$RELATION_NAME = ?' +
+            " ORDER BY CASE RDB\$CONSTRAINT_TYPE WHEN 'FOREIGN KEY' THEN 0 ELSE 1 END",
             table) { ResultSet rs ->
         if (rs.getString(1) != null) {
             out[Vendor.indexKey(null, rs.getString(1))] = rs.getString(2)
