@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::executor::block_on;
-use rudbkit_core::{TunnelAuth, TunnelConfig};
+use rudbkit_core::{JumpHost, TunnelAuth, TunnelConfig};
 use rudbkit_ssh::{
     AcceptAllVerifier, DEFAULT_BIND_ADDRESS, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_KEEPALIVE_MAX,
-    DEFAULT_KEEPALIVE_SECS, DEFAULT_SETUP_TIMEOUT_SECS, HostKeyVerifier, RejectAllVerifier,
-    SshAuth, SshErrorKind, SshTunnel, TunnelEvent, TunnelSpec, algorithm_name, fingerprint,
+    DEFAULT_KEEPALIVE_SECS, DEFAULT_SETUP_TIMEOUT_SECS, HopSpec, HostKeyVerifier,
+    RejectAllVerifier, SshAuth, SshErrorKind, SshTunnel, TunnelEvent, TunnelSecrets, TunnelSpec,
+    algorithm_name, fingerprint,
 };
 
 /// A throwaway ed25519 public key, together with the fingerprint OpenSSH prints
@@ -144,8 +145,12 @@ fn a_profiles_tunnel_block_converts_field_for_field() {
         remote_host: "db.internal".to_owned(),
         remote_port: 5432,
         local_port: 0,
+        jumps: Vec::new(),
     };
-    let spec = TunnelSpec::from_config(&config, Some("correct horse".to_owned()));
+    let spec = TunnelSpec::from_config(
+        &config,
+        TunnelSecrets::bastion(Some("correct horse".to_owned())),
+    );
 
     assert_eq!(spec.host, config.host);
     assert_eq!(spec.port, config.port);
@@ -153,6 +158,7 @@ fn a_profiles_tunnel_block_converts_field_for_field() {
     assert_eq!(spec.remote_host, config.remote_host);
     assert_eq!(spec.remote_port, config.remote_port);
     assert_eq!(spec.local_port, config.local_port);
+    assert!(spec.jumps.is_empty());
     assert_eq!(spec.keepalive_max, DEFAULT_KEEPALIVE_MAX);
     assert_eq!(spec.setup_timeout_secs, DEFAULT_SETUP_TIMEOUT_SECS);
     assert!(matches!(
@@ -178,22 +184,139 @@ fn a_profiles_tunnel_block_maps_every_auth_method() {
 
     config.auth = TunnelAuth::Agent;
     assert!(matches!(
-        TunnelSpec::from_config(&config, None).auth,
+        TunnelSpec::from_config(&config, TunnelSecrets::default()).auth,
         SshAuth::Agent
     ));
 
     config.auth = TunnelAuth::Password;
     assert!(matches!(
-        TunnelSpec::from_config(&config, Some("hunter2".to_owned())).auth,
+        TunnelSpec::from_config(&config, TunnelSecrets::bastion(Some("hunter2".to_owned()))).auth,
         SshAuth::Password(ref password) if password == "hunter2"
     ));
 
     // A password nobody stored must still be attempted as a password, so that
     // the bastion's rejection is what the user is told about.
     assert!(matches!(
-        TunnelSpec::from_config(&config, None).auth,
+        TunnelSpec::from_config(&config, TunnelSecrets::default()).auth,
         SshAuth::Password(ref password) if password.is_empty()
     ));
+}
+
+#[test]
+fn each_jump_host_takes_its_own_secret_in_order() {
+    let first = JumpHost {
+        host: "edge".to_owned(),
+        port: 2201,
+        username: "gate".to_owned(),
+        auth: TunnelAuth::Password,
+        ..JumpHost::new()
+    };
+    let second = JumpHost {
+        host: "inner".to_owned(),
+        username: "ops".to_owned(),
+        auth: TunnelAuth::Key {
+            path: PathBuf::from("~/.ssh/inner"),
+        },
+        ..JumpHost::new()
+    };
+    let third = JumpHost {
+        host: "last".to_owned(),
+        username: "ops".to_owned(),
+        auth: TunnelAuth::Agent,
+        ..JumpHost::new()
+    };
+    let config = TunnelConfig {
+        host: "bastion".to_owned(),
+        auth: TunnelAuth::Password,
+        jumps: vec![first.clone(), second.clone(), third],
+        ..TunnelConfig::default()
+    };
+    let mut secrets = TunnelSecrets::bastion(Some("bastion-secret".to_owned()));
+    secrets.jumps.insert(first.id, "edge-secret".to_owned());
+    secrets.jumps.insert(second.id, "inner-secret".to_owned());
+
+    let rendered = format!("{secrets:?}");
+    for secret in ["bastion-secret", "edge-secret", "inner-secret"] {
+        assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+    }
+
+    let spec = TunnelSpec::from_config(&config, secrets);
+    let hosts: Vec<_> = spec.jumps.iter().map(|hop| hop.host.as_str()).collect();
+    assert_eq!(hosts, ["edge", "inner", "last"]);
+    assert_eq!(spec.jumps[0].port, 2201);
+    assert_eq!(spec.jumps[0].username, "gate");
+    assert!(matches!(
+        spec.jumps[0].auth,
+        SshAuth::Password(ref password) if password == "edge-secret"
+    ));
+    assert!(matches!(
+        spec.jumps[1].auth,
+        SshAuth::PrivateKeyFile { ref passphrase, .. }
+            if passphrase.as_deref() == Some("inner-secret")
+    ));
+    assert!(matches!(spec.jumps[2].auth, SshAuth::Agent));
+    assert!(matches!(
+        spec.auth,
+        SshAuth::Password(ref password) if password == "bastion-secret"
+    ));
+
+    let rendered = format!("{spec:?}");
+    for secret in ["bastion-secret", "edge-secret", "inner-secret"] {
+        assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+    }
+}
+
+#[test]
+fn an_unreachable_jump_host_fails_before_the_bastion_is_tried() {
+    let mut spec = TunnelSpec::new(
+        "bastion.invalid",
+        22,
+        "ops",
+        SshAuth::Agent,
+        "db.internal",
+        5432,
+    );
+    spec.jumps = vec![HopSpec::new(
+        "127.0.0.1",
+        CLOSED_PORT,
+        "gate",
+        SshAuth::Password("pw".into()),
+    )];
+    let (_, events) = run_tunnel(spec, Duration::from_secs(10));
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            TunnelEvent::Error(SshErrorKind::Connect, message) => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a connect error: {events:?}"));
+    assert!(
+        message.contains(&format!("127.0.0.1:{CLOSED_PORT}")),
+        "the first hop is the one named: {message}"
+    );
+}
+
+#[test]
+fn a_missing_key_of_any_hop_fails_before_the_network_is_touched() {
+    let (listener, mut spec) = stalled_bastion();
+    spec.jumps = vec![HopSpec::new(
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+        "gate",
+        SshAuth::PrivateKeyFile {
+            path: PathBuf::from("/nonexistent/rudbkit-test-key"),
+            passphrase: None,
+        },
+    )];
+    let started = Instant::now();
+    let (_, events) = run_tunnel(spec, Duration::from_secs(10));
+    assert_eq!(
+        first_error(&events),
+        Some(SshErrorKind::KeyLoad),
+        "{events:?}"
+    );
+    // The stalled listener would hold a handshake for the whole setup limit.
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[test]

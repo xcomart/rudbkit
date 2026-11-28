@@ -55,8 +55,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
+use rudbkit_core::{JumpHost, TunnelAuth, TunnelConfig};
 use rudbkit_ssh::{
-    AcceptAllVerifier, RejectAllVerifier, SshAuth, SshErrorKind, SshTunnel, TunnelEvent, TunnelSpec,
+    AcceptAllVerifier, HopSpec, HostKeyVerifier, LeaseError, PublicKey, RejectAllVerifier, SshAuth,
+    SshErrorKind, SshTunnel, TunnelEvent, TunnelLease, TunnelSecrets, TunnelSpec, live_tunnels,
 };
 use russh::server::{Auth, ChannelOpenHandle, Handler as ServerHandler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure};
@@ -789,6 +791,8 @@ fn a_rejected_host_key_is_reported_as_a_host_key_rejection() {
 
     let announced = events.wait_for(|event| matches!(event, TunnelEvent::HostKey { .. }));
     let TunnelEvent::HostKey {
+        host,
+        port,
         algorithm,
         fingerprint,
         accepted,
@@ -797,7 +801,8 @@ fn a_rejected_host_key_is_reported_as_a_host_key_rejection() {
         unreachable!("the predicate matched HostKey");
     };
     // Announced even though it was refused: the UI has to be able to show the
-    // fingerprint it is asking the user about.
+    // fingerprint it is asking the user about, and for which host.
+    assert_eq!((host.as_str(), *port), ("127.0.0.1", bastion.port));
     assert_eq!(algorithm, "ssh-ed25519");
     assert!(fingerprint.starts_with("SHA256:"));
     assert!(!accepted);
@@ -896,6 +901,287 @@ fn a_bastion_that_goes_silent_is_given_up_after_unanswered_keepalives() {
     assert!(
         TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
         "port {port} was not released"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Jump hosts
+// ---------------------------------------------------------------------------
+
+/// Records every host key it is asked about, and rejects the ones on `port`.
+#[derive(Default)]
+struct RecordingVerifier {
+    /// `(host, port)` of every verification, in order.
+    seen: Mutex<Vec<(String, u16)>>,
+    /// The port whose key is rejected, if any.
+    reject: Option<u16>,
+}
+
+#[async_trait::async_trait]
+impl HostKeyVerifier for RecordingVerifier {
+    async fn verify(&self, host: &str, port: u16, _key: &PublicKey) -> bool {
+        self.seen
+            .lock()
+            .expect("the record is never poisoned")
+            .push((host.to_owned(), port));
+        self.reject != Some(port)
+    }
+}
+
+/// A hop through `jump`, named `localhost` so that it reads apart from the
+/// bastion, which the specifications name `127.0.0.1`.
+fn hop_through(jump: &Bastion) -> HopSpec {
+    HopSpec::new(
+        "localhost",
+        jump.port,
+        TEST_USER,
+        SshAuth::Password(TEST_PASSWORD.to_owned()),
+    )
+}
+
+#[test]
+fn a_jump_host_carries_the_tunnel_to_the_bastion() {
+    let jump = Bastion::start(Forwarding::Allow);
+    let bastion = Bastion::start(Forwarding::Allow);
+    let mut spec = bastion.spec();
+    spec.jumps = vec![hop_through(&jump)];
+
+    let verifier = Arc::new(RecordingVerifier::default());
+    let (tunnel, receiver) = SshTunnel::open(spec, verifier.clone());
+    let mut events = Events::new(receiver, Arc::clone(&bastion.clock));
+    events.wait_for(|event| matches!(event, TunnelEvent::Ready { .. }));
+
+    let mut socket = Forwarded::connect(tunnel.local_port()).expect("the forwarded port answers");
+    assert_eq!(socket.round_trip(b"SELECT 1").expect("echo"), b"SELECT 1");
+
+    // The jump host forwarded once — to the bastion's SSH port — and the
+    // bastion once, to the database. Neither was asked for a session.
+    assert_eq!(jump.state.forwards.load(Ordering::SeqCst), 1);
+    assert_eq!(bastion.state.forwards.load(Ordering::SeqCst), 1);
+    for server in [&jump, &bastion] {
+        assert_eq!(server.state.sessions.load(Ordering::SeqCst), 0);
+        assert_eq!(server.state.shells.load(Ordering::SeqCst), 0);
+    }
+
+    // Each host's key was checked under its own name, jump host first, and
+    // announced the same way.
+    assert_eq!(
+        *verifier.seen.lock().unwrap(),
+        [
+            ("localhost".to_owned(), jump.port),
+            ("127.0.0.1".to_owned(), bastion.port)
+        ]
+    );
+    let announced: Vec<_> = events
+        .seen
+        .iter()
+        .filter_map(|event| match event {
+            TunnelEvent::HostKey { host, port, .. } => Some((host.clone(), *port)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(announced, *verifier.seen.lock().unwrap());
+}
+
+#[test]
+fn two_jump_hosts_are_passed_through_in_order() {
+    let first = Bastion::start(Forwarding::Allow);
+    let second = Bastion::start(Forwarding::Allow);
+    let bastion = Bastion::start(Forwarding::Allow);
+    let mut spec = bastion.spec();
+    spec.jumps = vec![hop_through(&first), hop_through(&second)];
+
+    let verifier = Arc::new(RecordingVerifier::default());
+    let (tunnel, receiver) = SshTunnel::open(spec, verifier.clone());
+    let mut events = Events::new(receiver, Arc::clone(&bastion.clock));
+    events.wait_for(|event| matches!(event, TunnelEvent::Ready { .. }));
+
+    // Two sockets at once, both through the whole chain.
+    let mut one = Forwarded::connect(tunnel.local_port()).expect("the first socket");
+    let mut two = Forwarded::connect(tunnel.local_port()).expect("the second socket");
+    assert_eq!(one.round_trip(b"one").expect("echo"), b"one");
+    assert_eq!(two.round_trip(b"two").expect("echo"), b"two");
+
+    let ports: Vec<_> = verifier
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, port)| *port)
+        .collect();
+    assert_eq!(ports, [first.port, second.port, bastion.port]);
+    // The chain is built once; only the bastion forwards per socket.
+    assert_eq!(first.state.forwards.load(Ordering::SeqCst), 1);
+    assert_eq!(second.state.forwards.load(Ordering::SeqCst), 1);
+    assert_eq!(bastion.state.forwards.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_jump_host_that_forbids_forwarding_is_named_in_the_error() {
+    let jump = Bastion::start(Forwarding::Prohibited);
+    let bastion = Bastion::start(Forwarding::Allow);
+    let mut spec = bastion.spec();
+    spec.jumps = vec![hop_through(&jump)];
+    let (tunnel, receiver) = SshTunnel::open(spec, Arc::new(AcceptAllVerifier));
+    let mut events = Events::new(receiver, Arc::clone(&bastion.clock));
+
+    let ending = events.wait_for_end();
+    let TunnelEvent::Error(SshErrorKind::Forward, message) = &ending else {
+        panic!("expected a forwarding failure, got {ending:?}");
+    };
+    assert!(
+        message.contains("the jump host localhost") && message.contains("AllowTcpForwarding"),
+        "the message must name the jump host and its policy: {message}"
+    );
+    assert!(!tunnel.is_alive());
+    assert_eq!(jump.state.forwards.load(Ordering::SeqCst), 1);
+    assert_eq!(bastion.state.rejections.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_jump_host_that_rejects_the_credentials_is_named_in_the_error() {
+    let jump = Bastion::start(Forwarding::Allow);
+    let bastion = Bastion::start(Forwarding::Allow);
+    let mut spec = bastion.spec();
+    let mut hop = hop_through(&jump);
+    hop.auth = SshAuth::Password("swordfish".to_owned());
+    spec.jumps = vec![hop];
+    let (tunnel, receiver) = SshTunnel::open(spec, Arc::new(AcceptAllVerifier));
+    let mut events = Events::new(receiver, Arc::clone(&bastion.clock));
+
+    let ending = events.wait_for_end();
+    let TunnelEvent::Error(SshErrorKind::Auth, message) = &ending else {
+        panic!("expected an auth failure, got {ending:?}");
+    };
+    assert!(
+        message.contains("the jump host localhost rejected the credentials for user ops"),
+        "{message}"
+    );
+    assert!(!message.contains("swordfish"), "{message}");
+    assert!(!tunnel.is_alive());
+    assert_eq!(jump.state.rejections.load(Ordering::SeqCst), 1);
+    // The bastion was never reached.
+    assert_eq!(jump.state.forwards.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_rejected_jump_host_key_names_the_jump_host() {
+    let jump = Bastion::start(Forwarding::Allow);
+    let bastion = Bastion::start(Forwarding::Allow);
+    let mut spec = bastion.spec();
+    spec.jumps = vec![hop_through(&jump)];
+    let verifier = Arc::new(RecordingVerifier {
+        reject: Some(jump.port),
+        ..RecordingVerifier::default()
+    });
+    let (_tunnel, receiver) = SshTunnel::open(spec, verifier.clone());
+    let mut events = Events::new(receiver, Arc::clone(&bastion.clock));
+
+    let announced = events.wait_for(|event| matches!(event, TunnelEvent::HostKey { .. }));
+    assert!(
+        matches!(
+            &announced,
+            TunnelEvent::HostKey { host, port, accepted: false, .. }
+                if host == "localhost" && *port == jump.port
+        ),
+        "{announced:?}"
+    );
+    let ending = events.wait_for_end();
+    let TunnelEvent::Error(SshErrorKind::HostKeyRejected, message) = &ending else {
+        panic!("expected a host key rejection, got {ending:?}");
+    };
+    assert!(message.contains("jump host localhost"), "{message}");
+    // Stopped at the first host: the bastion's key was never asked about.
+    assert_eq!(verifier.seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn losing_a_jump_host_takes_the_tunnel_down_with_an_error() {
+    let jump = Bastion::start(Forwarding::Allow);
+    let bastion = Bastion::start(Forwarding::Allow);
+    let mut spec = bastion.spec();
+    spec.jumps = vec![hop_through(&jump)];
+    spec.keepalive_secs = 1;
+    let (tunnel, mut events) = bastion.open_with(spec);
+    let port = tunnel.local_port();
+
+    let mut socket = Forwarded::connect(port).expect("the forwarded port answers");
+    assert_eq!(socket.round_trip(b"before").expect("echo"), b"before");
+
+    jump.kill();
+
+    let ending = events.wait_for_end();
+    let TunnelEvent::Error(SshErrorKind::Io, message) = &ending else {
+        panic!(
+            "a chain that loses a host under a live session must report an error, got {ending:?}"
+        );
+    };
+    // The host that went is the one named, not the bastion behind it.
+    assert!(message.contains("the jump host localhost"), "{message}");
+    assert!(!tunnel.is_alive());
+    assert!(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
+        "port {port} was not released"
+    );
+}
+
+#[test]
+fn leases_share_one_tunnel_until_the_last_one_goes() {
+    let jump = Bastion::start(Forwarding::Allow);
+    let bastion = Bastion::start(Forwarding::Allow);
+    let hop = JumpHost {
+        host: "localhost".to_owned(),
+        port: jump.port,
+        username: TEST_USER.to_owned(),
+        auth: TunnelAuth::Password,
+        ..JumpHost::new()
+    };
+    let config = TunnelConfig {
+        host: "127.0.0.1".to_owned(),
+        port: bastion.port,
+        username: TEST_USER.to_owned(),
+        auth: TunnelAuth::Password,
+        remote_host: "127.0.0.1".to_owned(),
+        remote_port: bastion.echo_port,
+        jumps: vec![hop.clone()],
+        ..TunnelConfig::default()
+    };
+    let secrets = |jump_password: &str| {
+        let mut secrets = TunnelSecrets::bastion(Some(TEST_PASSWORD.to_owned()));
+        secrets.jumps.insert(hop.id, jump_password.to_owned());
+        secrets
+    };
+
+    let first = TunnelLease::acquire(&config, secrets(TEST_PASSWORD), Arc::new(AcceptAllVerifier))
+        .expect("the chain comes up");
+    let second = TunnelLease::acquire(&config, secrets(TEST_PASSWORD), Arc::new(AcceptAllVerifier))
+        .expect("the live tunnel is shared");
+    assert_eq!(first.local_port(), second.local_port());
+    assert_eq!(live_tunnels(), 1);
+    assert_eq!(jump.state.forwards.load(Ordering::SeqCst), 1, "one chain");
+
+    // Another jump host password is not let in on the first one's tunnel.
+    let refused = TunnelLease::acquire(&config, secrets("swordfish"), Arc::new(AcceptAllVerifier));
+    assert!(
+        matches!(&refused, Err(LeaseError::Failed(SshErrorKind::Auth, _))),
+        "{refused:?}"
+    );
+
+    let mut socket = Forwarded::connect(first.local_port()).expect("the forwarded port answers");
+    assert_eq!(socket.round_trip(b"shared").expect("echo"), b"shared");
+    drop(socket);
+
+    let watch = first.watch();
+    drop(second);
+    assert_eq!(live_tunnels(), 1, "the first lease still holds it");
+    drop(first);
+    assert_eq!(live_tunnels(), 0, "the last lease closed it");
+    let reason = bastion
+        .clock
+        .block_on(async { tokio::time::timeout(EVENT_TIMEOUT, watch).await });
+    assert!(
+        matches!(reason, Ok(Ok(_))),
+        "the lease heard the tunnel close: {reason:?}"
     );
 }
 

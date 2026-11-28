@@ -50,7 +50,7 @@ pub(crate) async fn forward(
     {
         Ok(channel) => channel,
         Err(error) => {
-            let reason = describe_open_failure(&error, &remote_host, remote_port);
+            let reason = describe_open_failure(&error, "the bastion", &remote_host, remote_port);
             log::warn!("connection {connection} was not forwarded: {reason}");
             emit(&events, TunnelEvent::ForwardRejected { connection, reason });
             return;
@@ -79,31 +79,38 @@ pub(crate) async fn forward(
     );
 }
 
-/// Explains why the bastion would not open a forwarding channel.
+/// Explains why `who` — "the bastion", or "the jump host edge" when the
+/// channel was for the next host of the chain — would not open a forwarding
+/// channel.
 ///
 /// The distinction the message has to draw is *whose* configuration is at
-/// fault — the bastion's forwarding policy, or the target host and port — since
+/// fault — the host's forwarding policy, or the target host and port — since
 /// that is the difference between two completely different fixes.
-fn describe_open_failure(error: &RusshError, remote_host: &str, remote_port: u16) -> String {
+pub(crate) fn describe_open_failure(
+    error: &RusshError,
+    who: &str,
+    remote_host: &str,
+    remote_port: u16,
+) -> String {
     match error {
         RusshError::ChannelOpenFailure(ChannelOpenFailure::AdministrativelyProhibited) => format!(
-            "the bastion refused to forward to {remote_host}:{remote_port}; it most likely has \
+            "{who} refused to forward to {remote_host}:{remote_port}; it most likely has \
              AllowTcpForwarding disabled, or restricts the destinations it will open"
         ),
         RusshError::ChannelOpenFailure(ChannelOpenFailure::ConnectFailed) => format!(
-            "the bastion could not reach {remote_host}:{remote_port}; check the host name as it \
+            "{who} could not reach {remote_host}:{remote_port}; check the host name as it \
              resolves inside the remote network, the port, and the target's own firewall"
         ),
         RusshError::ChannelOpenFailure(ChannelOpenFailure::ResourceShortage) => format!(
-            "the bastion is out of resources and would not open a channel to \
+            "{who} is out of resources and would not open a channel to \
              {remote_host}:{remote_port}"
         ),
         RusshError::ChannelOpenFailure(ChannelOpenFailure::UnknownChannelType) => format!(
-            "the bastion does not implement direct-tcpip forwarding, so {remote_host}:\
+            "{who} does not implement direct-tcpip forwarding, so {remote_host}:\
              {remote_port} cannot be reached through it"
         ),
         RusshError::ChannelOpenFailure(ChannelOpenFailure::Other { code, reason }) => format!(
-            "the bastion refused to forward to {remote_host}:{remote_port} with code {code}: \
+            "{who} refused to forward to {remote_host}:{remote_port} with code {code}: \
              {reason}"
         ),
         other => format!("could not forward to {remote_host}:{remote_port}: {other}"),

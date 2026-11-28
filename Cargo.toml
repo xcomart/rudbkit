@@ -26,3 +26,7 @@ anyhow = "1"
 serde_norway = "0.9"
 sha2 = "0.11"
 tempfile = "3"
+# The ids of a tunnel's jump hosts (`rudbkit-core`'s `JumpHost`), which name
+# each hop's keychain slot. Both applications already take it with these
+# features for their profile ids.
+uuid = { version = "1", features = ["v4", "serde"] }

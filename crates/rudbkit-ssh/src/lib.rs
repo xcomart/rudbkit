@@ -30,11 +30,20 @@
 //! }
 //! ```
 //!
+//! A bastion that is itself only reachable through other SSH hosts is reached
+//! the way OpenSSH's `ProxyJump` reaches it: [`TunnelSpec::jumps`] lists them in
+//! order, the first is connected to over TCP, and every later host — the
+//! bastion last — is logged in to inside a `direct-tcpip` channel the host
+//! before it opens. Each host is authenticated with its own [`HopSpec::auth`]
+//! and has its key checked under its own host and port.
+//!
 //! **This crate does not know what runs over the tunnel.** It knows nothing of
 //! JDBC, of drivers, or of sessions; it opens a port. Ordering a tunnel against
-//! the database session that uses it — tunnel up first, tunnel down last, and
-//! reference counting when several sessions share one — belongs to the
-//! application layer (architecture document, §3.1 and §9.3).
+//! the database session that uses it — tunnel up first, tunnel down last —
+//! belongs to the application layer (architecture document, §3.1 and §9.3).
+//! Sharing one tunnel between the sessions that need it is offered here, as
+//! [`TunnelLease`]: a lease per session, keyed by the whole chain and the
+//! secrets it logs in with, and the last lease to go closes the tunnel.
 //!
 //! Four things are worth knowing before using it:
 //!
@@ -69,14 +78,17 @@
 mod config;
 mod event;
 mod forward;
+mod lease;
 mod tunnel;
 mod verify;
 
 pub use config::{
     DEFAULT_BIND_ADDRESS, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_KEEPALIVE_MAX,
-    DEFAULT_KEEPALIVE_SECS, DEFAULT_SETUP_TIMEOUT_SECS, SshAuth, TunnelSpec,
+    DEFAULT_KEEPALIVE_SECS, DEFAULT_SETUP_TIMEOUT_SECS, HopSpec, SshAuth, TunnelSecrets,
+    TunnelSpec,
 };
 pub use event::{SshErrorKind, TunnelEvent};
+pub use lease::{LeaseError, TunnelLease, live_tunnels};
 pub use tunnel::SshTunnel;
 pub use verify::{
     AcceptAllVerifier, HostKeyVerifier, RejectAllVerifier, algorithm_name, fingerprint,

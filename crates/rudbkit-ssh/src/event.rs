@@ -14,12 +14,18 @@ use std::fmt;
 pub enum TunnelEvent {
     /// The transport is about to open a TCP connection to the bastion.
     Connecting,
-    /// The bastion presented its host key and the verifier ruled on it.
+    /// A host of the chain — a jump host, or the bastion — presented its host
+    /// key and the verifier ruled on it. Once per host, in the order they are
+    /// reached.
     ///
     /// Emitted for display purposes even when the key was rejected, in which
     /// case a [`TunnelEvent::Error`] with [`SshErrorKind::HostKeyRejected`]
     /// follows.
     HostKey {
+        /// The host, as the profile names it.
+        host: String,
+        /// Its SSH port.
+        port: u16,
         /// SSH name of the key algorithm, e.g. `ssh-ed25519`.
         algorithm: String,
         /// OpenSSH-style SHA-256 fingerprint, e.g. `SHA256:...`.

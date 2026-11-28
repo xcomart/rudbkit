@@ -4,5 +4,5 @@ pub mod builtins;
 pub mod dialects;
 mod tunnel;
 pub mod url;
-pub use tunnel::{TunnelAuth, TunnelConfig};
+pub use tunnel::{JumpHost, TunnelAuth, TunnelConfig};
 pub mod save;

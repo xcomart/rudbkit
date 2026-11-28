@@ -8,13 +8,16 @@
 //! [`TunnelSpec::from_config`] converts the on-disk
 //! [`TunnelConfig`](rudbkit_core::TunnelConfig) a connection profile carries.
 //! That type deliberately holds no secret — the password and the key passphrase
-//! live in the OS keychain — so the caller supplies the secret separately.
+//! live in the OS keychain — so the caller supplies the secrets separately, as
+//! [`TunnelSecrets`].
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
-use rudbkit_core::{TunnelAuth, TunnelConfig};
+use rudbkit_core::{JumpHost, TunnelAuth, TunnelConfig};
+use uuid::Uuid;
 
 /// Default keepalive interval, in seconds.
 pub const DEFAULT_KEEPALIVE_SECS: u64 = 30;
@@ -137,6 +140,104 @@ impl fmt::Debug for SshAuth {
     }
 }
 
+/// The secrets a profile's tunnel logs in with, read from the keychain.
+///
+/// One per host of the chain that asks for one: the bastion's, and each jump
+/// host's under its [`JumpHost::id`]. A host with no entry is given none —
+/// see [`SshAuth::from_tunnel_auth`] for what that means for each method.
+///
+/// `Debug` shows which hosts have a secret and nothing of the secrets.
+#[derive(Clone, Default)]
+pub struct TunnelSecrets {
+    /// The bastion's password or key passphrase.
+    pub bastion: Option<String>,
+    /// Each jump host's password or key passphrase, by [`JumpHost::id`].
+    pub jumps: HashMap<Uuid, String>,
+}
+
+impl TunnelSecrets {
+    /// Secrets for a tunnel with no jump hosts, or none that needs one.
+    pub fn bastion(secret: Option<String>) -> Self {
+        Self {
+            bastion: secret,
+            jumps: HashMap::new(),
+        }
+    }
+
+    /// The secret of the jump host `id`, if one was supplied.
+    pub fn jump(&self, id: Uuid) -> Option<&str> {
+        self.jumps.get(&id).map(String::as_str)
+    }
+}
+
+impl fmt::Debug for TunnelSecrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut jumps: Vec<_> = self.jumps.keys().collect();
+        jumps.sort();
+        f.debug_struct("TunnelSecrets")
+            .field("bastion", &mask(&self.bastion))
+            .field("jumps", &jumps)
+            .finish()
+    }
+}
+
+/// One SSH host the tunnel passes through on the way to the bastion.
+///
+/// The bastion's own login — host, port, user, method — and nothing to
+/// forward to: a jump host only connects onwards to the next host of the
+/// chain, over a `direct-tcpip` channel, and the next SSH session runs inside
+/// that channel.
+#[derive(Clone)]
+pub struct HopSpec {
+    /// Hostname or IP address, as the previous hop resolves it.
+    pub host: String,
+    /// TCP port of its SSH service.
+    pub port: u16,
+    /// Login user.
+    pub username: String,
+    /// The single authentication method to attempt.
+    pub auth: SshAuth,
+}
+
+impl HopSpec {
+    /// Builds a hop from its mandatory settings.
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        auth: SshAuth,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            username: username.into(),
+            auth,
+        }
+    }
+
+    /// Converts one jump host of a profile's tunnel block, given its secret.
+    pub fn from_jump(jump: &JumpHost, secret: Option<String>) -> Self {
+        Self {
+            host: jump.host.clone(),
+            port: jump.port,
+            username: jump.username.clone(),
+            auth: SshAuth::from_tunnel_auth(&jump.auth, secret),
+        }
+    }
+}
+
+impl fmt::Debug for HopSpec {
+    /// Written by hand so that a secret-bearing field added later cannot leak.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HopSpec")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("auth", &self.auth)
+            .finish()
+    }
+}
+
 /// Everything needed to forward a local port to a host behind a bastion.
 ///
 /// The shape mirrors [`TunnelConfig`], with the two settings that are transport
@@ -152,6 +253,15 @@ pub struct TunnelSpec {
     pub username: String,
     /// The single authentication method to attempt.
     pub auth: SshAuth,
+    /// Hosts to pass through before the bastion, in the order they are
+    /// reached — OpenSSH's `ProxyJump`. Empty, the default, connects to the
+    /// bastion directly.
+    ///
+    /// The first is reached over TCP; each one after it, and then the bastion,
+    /// through a `direct-tcpip` channel the one before opens. Every host of the
+    /// chain is verified by the same [`HostKeyVerifier`](crate::HostKeyVerifier)
+    /// under its own host and port.
+    pub jumps: Vec<HopSpec>,
     /// Host the bastion connects onwards to, as named from *inside* the remote
     /// network.
     pub remote_host: String,
@@ -210,6 +320,7 @@ impl TunnelSpec {
             port,
             username: username.into(),
             auth,
+            jumps: Vec::new(),
             remote_host: remote_host.into(),
             remote_port,
             local_port: 0,
@@ -221,18 +332,24 @@ impl TunnelSpec {
         }
     }
 
-    /// Converts the `tunnel` block of a connection profile.
+    /// Converts the `tunnel` block of a connection profile, jump hosts and
+    /// all.
     ///
-    /// `secret` is whatever the application's keychain holds in this
-    /// profile's tunnel secret slot — a password or a key passphrase,
-    /// depending on the method. See
-    /// [`SshAuth::from_tunnel_auth`].
-    pub fn from_config(config: &TunnelConfig, secret: Option<String>) -> Self {
+    /// `secrets` is whatever the application's keychain holds for the
+    /// profile's tunnel — a password or a key passphrase for each host,
+    /// depending on its method. See [`SshAuth::from_tunnel_auth`].
+    pub fn from_config(config: &TunnelConfig, secrets: TunnelSecrets) -> Self {
+        let TunnelSecrets { bastion, mut jumps } = secrets;
         Self {
             host: config.host.clone(),
             port: config.port,
             username: config.username.clone(),
-            auth: SshAuth::from_tunnel_auth(&config.auth, secret),
+            auth: SshAuth::from_tunnel_auth(&config.auth, bastion),
+            jumps: config
+                .jumps
+                .iter()
+                .map(|jump| HopSpec::from_jump(jump, jumps.remove(&jump.id)))
+                .collect(),
             remote_host: config.remote_host.clone(),
             remote_port: config.remote_port,
             local_port: config.local_port,
@@ -254,6 +371,7 @@ impl fmt::Debug for TunnelSpec {
             .field("port", &self.port)
             .field("username", &self.username)
             .field("auth", &self.auth)
+            .field("jumps", &self.jumps)
             .field("remote_host", &self.remote_host)
             .field("remote_port", &self.remote_port)
             .field("local_port", &self.local_port)

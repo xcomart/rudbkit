@@ -25,14 +25,16 @@ use std::time::Duration;
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::channel::oneshot;
+use parking_lot::Mutex;
 use russh::client::{self, AuthResult, DisconnectReason, Handle};
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::{Disconnect, keys};
+use russh::{ChannelStream, Disconnect, keys};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::{SshAuth, TunnelSpec};
 use crate::event::{SshErrorKind, TunnelEvent};
-use crate::forward::forward;
+use crate::forward::{describe_open_failure, forward};
 use crate::verify::{HostKeyVerifier, algorithm_name, fingerprint};
 
 /// Host key has not been examined yet.
@@ -297,13 +299,90 @@ type Loss = (SshErrorKind, String);
 /// How far setup got, so a setup timeout can say where it stalled.
 #[derive(Clone, Copy)]
 enum Phase {
-    /// Waiting for the TCP connect.
+    /// Waiting for the TCP connect to the first host of the chain.
     Tcp,
+    /// Waiting for the previous host of the chain to open a channel to this
+    /// one.
+    Channel,
     /// Connected; waiting for the banner, the key exchange and the host key.
     Handshake,
-    /// Handshake done; waiting for the bastion to accept the credentials.
+    /// Handshake done; waiting for the host to accept the credentials.
     Auth,
 }
+
+/// One SSH login of the chain: a jump host, or the bastion that ends it.
+struct Leg<'a> {
+    /// Host, as the previous leg — or, for the first, this machine — names it.
+    host: &'a str,
+    /// Its SSH port.
+    port: u16,
+    /// Login user.
+    username: &'a str,
+    /// The method to log in with.
+    auth: &'a SshAuth,
+    /// Whether this is a jump host rather than the bastion.
+    jump: bool,
+}
+
+impl Leg<'_> {
+    /// How messages name the host: "the bastion db-gw", "the jump host edge".
+    fn label(&self) -> String {
+        if self.jump {
+            format!("the jump host {}", self.host)
+        } else {
+            format!("the bastion {}", self.host)
+        }
+    }
+
+    /// `host:port`, with "the jump host" in front for a jump host.
+    fn address(&self) -> String {
+        if self.jump {
+            format!("the jump host {}:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// The logins of `spec` in the order they are made: every jump host, then the
+/// bastion.
+fn legs(spec: &TunnelSpec) -> Vec<Leg<'_>> {
+    spec.jumps
+        .iter()
+        .map(|hop| Leg {
+            host: &hop.host,
+            port: hop.port,
+            username: &hop.username,
+            auth: &hop.auth,
+            jump: true,
+        })
+        .chain(std::iter::once(Leg {
+            host: &spec.host,
+            port: spec.port,
+            username: &spec.username,
+            auth: &spec.auth,
+            jump: false,
+        }))
+        .collect()
+}
+
+/// The transports of an established chain.
+///
+/// `handle` is the bastion's, which every forwarded connection opens its
+/// channel on. `jumps` are the jump hosts' in the order they were reached,
+/// held only so that they stay up: each carries the next one's session inside
+/// a channel, and dropping one would cut every host after it.
+struct Chain {
+    /// The bastion's transport.
+    handle: Handle<ClientHandler>,
+    /// The jump hosts' transports, first one first.
+    jumps: Vec<Handle<ClientHandler>>,
+}
+
+/// The one place the reason an established transport ended is sent, shared by
+/// every host of the chain. The first to report wins: a jump host that drops
+/// takes every session after it down too, and it is the one that knows why.
+type LostSlot = Arc<Mutex<Option<oneshot::Sender<Loss>>>>;
 
 /// Credentials resolved into the form russh wants, with any private key already
 /// parsed and decrypted.
@@ -317,8 +396,10 @@ enum Credentials {
 }
 
 /// Bridges russh's transport callbacks to the verifier and the event stream.
+///
+/// One per host of the chain.
 pub(crate) struct ClientHandler {
-    /// Policy consulted for the bastion's host key.
+    /// Policy consulted for the host's key.
     verifier: Arc<dyn HostKeyVerifier>,
     /// Where [`TunnelEvent::HostKey`] is published.
     events: UnboundedSender<TunnelEvent>,
@@ -326,13 +407,15 @@ pub(crate) struct ClientHandler {
     host: String,
     /// Port being connected to, for the verifier's benefit.
     port: u16,
+    /// How messages name the host; see [`Leg::label`].
+    label: String,
     /// Records the verdict so a handshake error can be attributed correctly.
     key_state: Arc<AtomicU8>,
     /// Where the reason an established transport ended is sent, once. The
     /// accept loop waits on the other end, which is what lets it report an
     /// unanswered keepalive as such — and at once, rather than at the next
     /// liveness check.
-    lost: Option<oneshot::Sender<Loss>>,
+    lost: LostSlot,
     /// The keepalive settings, for the message when they run out.
     keepalive: (u64, usize),
 }
@@ -367,6 +450,8 @@ impl client::Handler for ClientHandler {
         emit(
             &self.events,
             TunnelEvent::HostKey {
+                host: self.host.clone(),
+                port: self.port,
                 algorithm,
                 fingerprint,
                 accepted,
@@ -387,21 +472,18 @@ impl client::Handler for ClientHandler {
         let (loss, result) = match reason {
             DisconnectReason::ReceivedDisconnect(info) => {
                 let message = if info.message.is_empty() {
-                    format!("the bastion {} closed the connection", self.host)
+                    format!("{} closed the connection", self.label)
                 } else {
-                    format!(
-                        "the bastion {} closed the connection: {}",
-                        self.host, info.message
-                    )
+                    format!("{} closed the connection: {}", self.label, info.message)
                 };
                 ((SshErrorKind::Io, message), Ok(()))
             }
             DisconnectReason::Error(russh::Error::KeepaliveTimeout) => {
                 let (secs, max) = self.keepalive;
                 let message = format!(
-                    "the bastion {} stopped answering: {max} keepalives sent {secs}s apart \
+                    "{} stopped answering: {max} keepalives sent {secs}s apart \
                      went unanswered",
-                    self.host
+                    self.label
                 );
                 (
                     (SshErrorKind::Timeout, message),
@@ -409,11 +491,12 @@ impl client::Handler for ClientHandler {
                 )
             }
             DisconnectReason::Error(error) => {
-                let message = format!("the connection to the bastion was lost: {error}");
+                let label = self.label.strip_prefix("the ").unwrap_or(&self.label);
+                let message = format!("the connection to the {label} was lost: {error}");
                 ((SshErrorKind::Io, message), Err(error))
             }
         };
-        if let Some(lost) = self.lost.take() {
+        if let Some(lost) = self.lost.lock().take() {
             let _ = lost.send(loss);
         }
         result
@@ -509,7 +592,7 @@ async fn run(
         () = wait_for_close(&mut commands) => None,
     };
 
-    let handle = match outcome {
+    let chain = match outcome {
         None => {
             drop(listener);
             emit(
@@ -526,8 +609,9 @@ async fn run(
             emit(events, TunnelEvent::Error(failure.kind, failure.message));
             return;
         }
-        Some(Ok(handle)) => handle,
+        Some(Ok(chain)) => chain,
     };
+    let Chain { handle, jumps } = chain;
 
     // Shared with every forwarding task: each opens its own channel on this one
     // transport, and `Handle`'s methods all take `&self`, so they never contend.
@@ -537,16 +621,25 @@ async fn run(
     if !emit(events, TunnelEvent::Ready { local_port }) {
         alive.store(false, Ordering::SeqCst);
         drop(listener);
-        shutdown(&handle).await;
+        shutdown(&handle, &jumps).await;
         return;
     }
 
     // `accept_loop` consumes the listener, so the local port is closed by the
     // time it returns — which is before the terminal event below. A caller that
     // waits for `Disconnected` can therefore rebind the port immediately.
-    let ending = accept_loop(&spec, &handle, listener, &mut commands, &mut lost, events).await;
+    let ending = accept_loop(
+        &spec,
+        &handle,
+        &jumps,
+        listener,
+        &mut commands,
+        &mut lost,
+        events,
+    )
+    .await;
     alive.store(false, Ordering::SeqCst);
-    shutdown(&handle).await;
+    shutdown(&handle, &jumps).await;
 
     match ending {
         Ending::Closed(reason) => {
@@ -567,83 +660,153 @@ async fn wait_for_close(commands: &mut UnboundedReceiver<Command>) {
     }
 }
 
-/// Loads credentials, connects to the bastion and authenticates, all within
-/// [`TunnelSpec::setup_timeout_secs`].
+/// Loads credentials, then connects to and authenticates with every host of
+/// the chain in turn, all within [`TunnelSpec::setup_timeout_secs`].
 ///
 /// Stops there on purpose: a tunnel needs no session channel, no pty and no
 /// shell, and asking for any of them would break on a bastion account whose
 /// login shell is `nologin`.
 ///
-/// The limit covers everything after the key file is read, because the TCP
+/// The limit covers everything after the key files are read, because the TCP
 /// connect timeout alone leaves the rest unbounded: a bastion that accepts the
 /// connection and never sends its banner — a wedged sshd, a port forwarded to
 /// something that is not SSH — would otherwise hold this worker, and any caller
-/// waiting for [`TunnelEvent::Ready`], for ever.
+/// waiting for [`TunnelEvent::Ready`], for ever. It is one limit for the whole
+/// chain, not one per host, because it bounds what the caller waits for.
 async fn connect(
     spec: &TunnelSpec,
     verifier: &Arc<dyn HostKeyVerifier>,
     events: &UnboundedSender<TunnelEvent>,
     lost: oneshot::Sender<Loss>,
-) -> Result<Handle<ClientHandler>, Failure> {
-    // Done first so a bad key path fails fast, before touching the network.
-    let credentials = load_credentials(&spec.auth)?;
+) -> Result<Chain, Failure> {
+    let legs = legs(spec);
+    // Done first, for every host, so a bad key path fails fast, before touching
+    // the network — and before a jump host has been logged in to for nothing.
+    let credentials = legs
+        .iter()
+        .map(|leg| load_credentials(leg.auth))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let phase = Cell::new(Phase::Tcp);
-    let setup = establish(spec, verifier, events, lost, credentials, &phase);
+    let phase = Cell::new((0, Phase::Tcp));
+    let lost: LostSlot = Arc::new(Mutex::new(Some(lost)));
+    let setup = establish(spec, &legs, verifier, events, &lost, credentials, &phase);
     if spec.setup_timeout_secs == 0 {
         return setup.await;
     }
     let limit = Duration::from_secs(spec.setup_timeout_secs);
     match tokio::time::timeout(limit, setup).await {
         Ok(result) => result,
-        Err(_) => Err(setup_timed_out(spec, phase.get())),
+        Err(_) => {
+            let (index, phase) = phase.get();
+            Err(setup_timed_out(spec, &legs, index, phase))
+        }
     }
 }
 
-/// The failure reported when setup runs past its limit, naming the step that
-/// stalled — each one points at a different culprit.
-fn setup_timed_out(spec: &TunnelSpec, phase: Phase) -> Failure {
+/// The failure reported when setup runs past its limit, naming the host and
+/// the step that stalled — each one points at a different culprit.
+fn setup_timed_out(spec: &TunnelSpec, legs: &[Leg<'_>], index: usize, phase: Phase) -> Failure {
     let secs = spec.setup_timeout_secs;
+    let leg = &legs[index];
     let message = match phase {
         Phase::Tcp => format!(
             "connecting to {}:{} timed out after {secs}s",
-            spec.host, spec.port
+            leg.host, leg.port
+        ),
+        Phase::Channel => format!(
+            "{} did not open the connection to {}:{} within {secs}s",
+            legs[index - 1].label(),
+            leg.host,
+            leg.port
         ),
         Phase::Handshake => format!(
-            "{}:{} accepted the connection but did not complete the SSH handshake within \
+            "{} accepted the connection but did not complete the SSH handshake within \
              {secs}s; check that it is an SSH server and that it is not overloaded",
-            spec.host, spec.port
+            leg.address()
         ),
         Phase::Auth => format!(
-            "the bastion {} did not finish authenticating user {} within {secs}s",
-            spec.host, spec.username
+            "{} did not finish authenticating user {} within {secs}s",
+            leg.label(),
+            leg.username
         ),
     };
     Failure::new(SshErrorKind::Timeout, message)
 }
 
-/// The body of [`connect`]: TCP connect, handshake, authentication, with
-/// `phase` kept up to date for the timeout's message.
+/// The body of [`connect`]: the first host over TCP, each later one through a
+/// channel the one before opens, each with its handshake and authentication,
+/// and `phase` kept up to date for the timeout's message.
+///
+/// A failure anywhere drops the hosts already logged in to, which closes them:
+/// nothing of a half-built chain outlives the attempt.
 async fn establish(
     spec: &TunnelSpec,
+    legs: &[Leg<'_>],
     verifier: &Arc<dyn HostKeyVerifier>,
     events: &UnboundedSender<TunnelEvent>,
-    lost: oneshot::Sender<Loss>,
-    credentials: Credentials,
-    phase: &Cell<Phase>,
-) -> Result<Handle<ClientHandler>, Failure> {
-    let stream = tcp_connect(spec).await?;
-    phase.set(Phase::Handshake);
+    lost: &LostSlot,
+    credentials: Vec<Credentials>,
+    phase: &Cell<(usize, Phase)>,
+) -> Result<Chain, Failure> {
+    let last = legs.len() - 1;
+    let mut jumps: Vec<Handle<ClientHandler>> = Vec::with_capacity(last);
+    for (index, (leg, credentials)) in legs.iter().zip(credentials).enumerate() {
+        // Only the bastion keeps the session alive with keepalives: everything
+        // the tunnel carries crosses every jump host on the way, so a jump host
+        // that goes silent shows as a bastion that stopped answering.
+        let keepalive = (index == last).then_some((spec.keepalive_secs, spec.keepalive_max));
+        let handler = |key_state: &Arc<AtomicU8>| ClientHandler {
+            verifier: Arc::clone(verifier),
+            events: events.clone(),
+            host: leg.host.to_owned(),
+            port: leg.port,
+            label: leg.label(),
+            key_state: Arc::clone(key_state),
+            lost: Arc::clone(lost),
+            keepalive: (spec.keepalive_secs, spec.keepalive_max),
+        };
+        let mut handle = match jumps.last() {
+            None => {
+                phase.set((index, Phase::Tcp));
+                let stream = tcp_connect(leg, spec.connect_timeout_secs).await?;
+                phase.set((index, Phase::Handshake));
+                handshake(stream, leg, keepalive, handler).await?
+            }
+            Some(through) => {
+                phase.set((index, Phase::Channel));
+                let stream =
+                    hop_stream(through, &legs[index - 1], leg, spec.connect_timeout_secs).await?;
+                phase.set((index, Phase::Handshake));
+                handshake(stream, leg, keepalive, handler).await?
+            }
+        };
+        phase.set((index, Phase::Auth));
+        authenticate(&mut handle, leg, credentials).await?;
+        if index == last {
+            return Ok(Chain { handle, jumps });
+        }
+        jumps.push(handle);
+    }
+    unreachable!("a chain always ends with the bastion")
+}
+
+/// Runs the SSH handshake with one host of the chain over `stream` — a TCP
+/// connection for the first, a `direct-tcpip` channel for every later one.
+///
+/// `keepalive` is the interval and the limit of unanswered ones, or `None` for
+/// a host that sends none.
+async fn handshake<S>(
+    stream: S,
+    leg: &Leg<'_>,
+    keepalive: Option<(u64, usize)>,
+    handler: impl FnOnce(&Arc<AtomicU8>) -> ClientHandler,
+) -> Result<Handle<ClientHandler>, Failure>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let key_state = Arc::new(AtomicU8::new(KEY_UNCHECKED));
-    let handler = ClientHandler {
-        verifier: Arc::clone(verifier),
-        events: events.clone(),
-        host: spec.host.clone(),
-        port: spec.port,
-        key_state: Arc::clone(&key_state),
-        lost: Some(lost),
-        keepalive: (spec.keepalive_secs, spec.keepalive_max),
-    };
+    let handler = handler(&key_state);
+    let (keepalive_secs, keepalive_max) = keepalive.unwrap_or((0, 0));
 
     let client_config = client::Config {
         // russh's own keepalive rather than one sent from the accept loop: it
@@ -653,34 +816,81 @@ async fn establish(
         // keepalive that is merely *sent* proves nothing: on a half-dead TCP
         // connection the write succeeds into the kernel's buffer for minutes.
         inactivity_timeout: None,
-        keepalive_interval: (spec.keepalive_secs > 0)
-            .then(|| Duration::from_secs(spec.keepalive_secs)),
-        keepalive_max: spec.keepalive_max,
+        keepalive_interval: (keepalive_secs > 0).then(|| Duration::from_secs(keepalive_secs)),
+        keepalive_max,
         ..client::Config::default()
     };
 
-    let mut handle = client::connect_stream(Arc::new(client_config), stream, handler)
+    client::connect_stream(Arc::new(client_config), stream, handler)
         .await
         .map_err(|error| {
             if key_state.load(Ordering::SeqCst) == KEY_REJECTED {
                 Failure::new(
                     SshErrorKind::HostKeyRejected,
-                    format!(
-                        "the host key presented by {}:{} was rejected",
-                        spec.host, spec.port
-                    ),
+                    format!("the host key presented by {} was rejected", leg.address()),
                 )
             } else {
+                let host = if leg.jump {
+                    leg.label()
+                } else {
+                    leg.host.to_owned()
+                };
                 Failure::new(
                     SshErrorKind::Connect,
-                    format!("SSH handshake with {} failed: {error}", spec.host),
+                    format!("SSH handshake with {host} failed: {error}"),
                 )
             }
-        })?;
+        })
+}
 
-    phase.set(Phase::Auth);
-    authenticate(&mut handle, spec, credentials).await?;
-    Ok(handle)
+/// Asks `through`, the transport of the host before `next` in the chain, to
+/// open a `direct-tcpip` channel to `next`'s SSH port, which the next
+/// handshake then runs inside.
+///
+/// Bounded by the connect timeout, because the far end of the channel is a TCP
+/// connect the jump host makes on our behalf. A refusal is a
+/// [`SshErrorKind::Forward`] failure, named after the jump host that refused:
+/// its forwarding policy, or what it can reach, is where the fix is.
+async fn hop_stream(
+    through: &Handle<ClientHandler>,
+    through_leg: &Leg<'_>,
+    next: &Leg<'_>,
+    connect_timeout_secs: u64,
+) -> Result<ChannelStream<client::Msg>, Failure> {
+    let open = through.channel_open_direct_tcpip(
+        next.host.to_owned(),
+        u32::from(next.port),
+        "127.0.0.1".to_owned(),
+        0,
+    );
+    let opened = if connect_timeout_secs == 0 {
+        open.await
+    } else {
+        let limit = Duration::from_secs(connect_timeout_secs);
+        match tokio::time::timeout(limit, open).await {
+            Ok(opened) => opened,
+            Err(_) => {
+                return Err(Failure::new(
+                    SshErrorKind::Timeout,
+                    format!(
+                        "{} did not open the connection to {}:{} within {connect_timeout_secs}s",
+                        through_leg.label(),
+                        next.host,
+                        next.port
+                    ),
+                ));
+            }
+        }
+    };
+    let channel = opened.map_err(|error| {
+        Failure::new(
+            SshErrorKind::Forward,
+            describe_open_failure(&error, &through_leg.label(), next.host, next.port),
+        )
+    })?;
+    // Dropping the stream closes the channel, and with it the session the next
+    // host runs inside it.
+    Ok(channel.into_stream())
 }
 
 /// Reads and decrypts the private key, or hands back the password unchanged.
@@ -754,34 +964,35 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Opens the TCP connection to the bastion, honoring the connect timeout.
-async fn tcp_connect(spec: &TunnelSpec) -> Result<TcpStream, Failure> {
-    let address = (spec.host.as_str(), spec.port);
+/// Opens the TCP connection to the first host of the chain, honoring the
+/// connect timeout.
+async fn tcp_connect(leg: &Leg<'_>, connect_timeout_secs: u64) -> Result<TcpStream, Failure> {
+    let address = (leg.host, leg.port);
     let attempt = TcpStream::connect(address);
 
-    let connected = if spec.connect_timeout_secs == 0 {
+    let connected = if connect_timeout_secs == 0 {
         attempt.await.map_err(|error| {
             Failure::new(
                 SshErrorKind::Connect,
-                format!("could not connect to {}:{}: {error}", spec.host, spec.port),
+                format!("could not connect to {}:{}: {error}", leg.host, leg.port),
             )
         })?
     } else {
-        let limit = Duration::from_secs(spec.connect_timeout_secs);
+        let limit = Duration::from_secs(connect_timeout_secs);
         match tokio::time::timeout(limit, attempt).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
                 return Err(Failure::new(
                     SshErrorKind::Connect,
-                    format!("could not connect to {}:{}: {error}", spec.host, spec.port),
+                    format!("could not connect to {}:{}: {error}", leg.host, leg.port),
                 ));
             }
             Err(_) => {
                 return Err(Failure::new(
                     SshErrorKind::Timeout,
                     format!(
-                        "connecting to {}:{} timed out after {}s",
-                        spec.host, spec.port, spec.connect_timeout_secs
+                        "connecting to {}:{} timed out after {connect_timeout_secs}s",
+                        leg.host, leg.port
                     ),
                 ));
             }
@@ -797,30 +1008,25 @@ async fn tcp_connect(spec: &TunnelSpec) -> Result<TcpStream, Failure> {
 /// Runs exactly the one authentication method the specification asks for.
 async fn authenticate(
     handle: &mut Handle<ClientHandler>,
-    spec: &TunnelSpec,
+    leg: &Leg<'_>,
     credentials: Credentials,
 ) -> Result<(), Failure> {
     let result = match credentials {
         Credentials::Password(password) => {
-            handle
-                .authenticate_password(spec.username.as_str(), password)
-                .await
+            handle.authenticate_password(leg.username, password).await
         }
         Credentials::Key(key) => {
             let hash_alg = best_rsa_hash(handle).await?;
             handle
-                .authenticate_publickey(
-                    spec.username.as_str(),
-                    PrivateKeyWithHashAlg::new(key, hash_alg),
-                )
+                .authenticate_publickey(leg.username, PrivateKeyWithHashAlg::new(key, hash_alg))
                 .await
         }
-        Credentials::Agent => return authenticate_with_agent(handle, spec).await,
+        Credentials::Agent => return authenticate_with_agent(handle, leg).await,
     };
 
     match result {
         Ok(outcome) if outcome.success() => Ok(()),
-        Ok(_) => Err(rejected(spec)),
+        Ok(_) => Err(rejected(leg)),
         // A transport-level break during authentication is not a rejection, so
         // it must not be reported as one.
         Err(error) => Err(Failure::new(
@@ -830,16 +1036,17 @@ async fn authenticate(
     }
 }
 
-/// The failure reported when the bastion turns our credentials down.
+/// The failure reported when a host of the chain turns our credentials down.
 ///
-/// Names the user and nothing else — never the method's secret, and never the
-/// secret's length or shape.
-fn rejected(spec: &TunnelSpec) -> Failure {
+/// Names the host and the user and nothing else — never the method's secret,
+/// and never the secret's length or shape.
+fn rejected(leg: &Leg<'_>) -> Failure {
     Failure::new(
         SshErrorKind::Auth,
         format!(
-            "the bastion {} rejected the credentials for user {}",
-            spec.host, spec.username
+            "{} rejected the credentials for user {}",
+            leg.label(),
+            leg.username
         ),
     )
 }
@@ -866,7 +1073,7 @@ async fn best_rsa_hash(handle: &Handle<ClientHandler>) -> Result<Option<HashAlg>
 /// agent reports an authentication failure, not a fallback to anything else.
 async fn authenticate_with_agent(
     handle: &mut Handle<ClientHandler>,
-    spec: &TunnelSpec,
+    leg: &Leg<'_>,
 ) -> Result<(), Failure> {
     let mut agent = connect_agent().await?;
     let identities = agent.request_identities().await.map_err(|error| {
@@ -897,11 +1104,11 @@ async fn authenticate_with_agent(
             Algorithm::Rsa { .. } => rsa_hash,
             _ => None,
         };
-        log::debug!("offering agent identity {comment:?} to {}", spec.host);
+        log::debug!("offering agent identity {comment:?} to {}", leg.host);
         offered += 1;
 
         match handle
-            .authenticate_publickey_with(spec.username.as_str(), key, hash_alg, &mut agent)
+            .authenticate_publickey_with(leg.username, key, hash_alg, &mut agent)
             .await
         {
             Ok(AuthResult::Success) => return Ok(()),
@@ -909,7 +1116,7 @@ async fn authenticate_with_agent(
             Err(error) => {
                 return Err(Failure::new(
                     SshErrorKind::Io,
-                    format!("the SSH agent could not sign for {}: {error}", spec.host),
+                    format!("the SSH agent could not sign for {}: {error}", leg.host),
                 ));
             }
         }
@@ -921,7 +1128,7 @@ async fn authenticate_with_agent(
             "the SSH agent offered only certificates, which are not supported",
         ));
     }
-    Err(rejected(spec))
+    Err(rejected(leg))
 }
 
 /// Connects to the platform's SSH agent.
@@ -986,6 +1193,7 @@ enum Step {
 async fn accept_loop(
     spec: &TunnelSpec,
     handle: &Arc<Handle<ClientHandler>>,
+    jumps: &[Handle<ClientHandler>],
     listener: TcpListener,
     commands: &mut UnboundedReceiver<Command>,
     lost: &mut oneshot::Receiver<Loss>,
@@ -1059,7 +1267,7 @@ async fn accept_loop(
                 // russh sends the keepalives and counts the unanswered ones;
                 // this tick only makes sure a loss is noticed within one
                 // keepalive interval even if nothing reported it.
-                if handle.is_closed() {
+                if chain_closed(handle, jumps) {
                     return lost_ending(lost).await;
                 }
             }
@@ -1073,12 +1281,19 @@ async fn accept_loop(
                 // A tunnel that dies under a live session is an error, never a
                 // quiet reconnect: a transaction may have been open on it, and
                 // the user has to be told (architecture document, §9.3).
-                if handle.is_closed() {
+                if chain_closed(handle, jumps) {
                     return lost_ending(lost).await;
                 }
             }
         }
     }
+}
+
+/// Whether any transport of the chain has closed. Losing a jump host cuts
+/// every host after it, the bastion included, even before the bastion's own
+/// session notices.
+fn chain_closed(handle: &Handle<ClientHandler>, jumps: &[Handle<ClientHandler>]) -> bool {
+    handle.is_closed() || jumps.iter().any(Handle::is_closed)
 }
 
 /// The ending for a transport found closed: the handler's reason if it arrives
@@ -1127,19 +1342,24 @@ async fn tick(timer: &mut Option<tokio::time::Interval>) {
     }
 }
 
-/// Closes the transport, giving up after [`SHUTDOWN_GRACE`] so an unresponsive
-/// bastion cannot keep the worker thread alive.
+/// Closes the chain from the bastion back to the first jump host, giving up on
+/// each after [`SHUTDOWN_GRACE`] so an unresponsive host cannot keep the worker
+/// thread alive.
 ///
 /// Takes the handle by reference because the forwarding tasks share it; the last
 /// reference goes away with the runtime a moment later, which is what actually
 /// stops russh's own session task and every forwarding task still in flight.
-async fn shutdown(handle: &Handle<ClientHandler>) {
-    let teardown = handle.disconnect(Disconnect::ByApplication, "", "en-US");
-    if tokio::time::timeout(SHUTDOWN_GRACE, teardown)
-        .await
-        .is_err()
-    {
-        log::debug!("timed out while closing the ssh tunnel");
+/// Last in, first out: each jump host carries the session after it, so closing
+/// one first would cut the next before it could say goodbye.
+async fn shutdown(handle: &Handle<ClientHandler>, jumps: &[Handle<ClientHandler>]) {
+    for transport in std::iter::once(handle).chain(jumps.iter().rev()) {
+        let teardown = transport.disconnect(Disconnect::ByApplication, "", "en-US");
+        if tokio::time::timeout(SHUTDOWN_GRACE, teardown)
+            .await
+            .is_err()
+        {
+            log::debug!("timed out while closing the ssh tunnel");
+        }
     }
 }
 

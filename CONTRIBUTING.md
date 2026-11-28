@@ -57,8 +57,8 @@ cargo deny --locked check advisories
 
 | Crate | Responsibility |
 | --- | --- |
-| `rudbkit-core` | SSH profile serialization, JDBC URL templates and redirection, connection validation, ordered profile/secret saving, the products the applications ship a driver definition for, and the dialect profiles both read and ship |
-| `rudbkit-ssh` | Authentication, host-key verification, forwarding and generation-owned tunnel leases |
+| `rudbkit-core` | SSH profile serialization (the bastion and its jump hosts), JDBC URL templates and redirection, connection validation, ordered profile/secret saving, the products the applications ship a driver definition for, and the dialect profiles both read and ship |
+| `rudbkit-ssh` | Authentication, host-key verification, forwarding through a chain of jump hosts, and generation-owned tunnel leases |
 | `rudbkit-jdbc` | Runtime discovery, JVM configuration/startup and JNI access to an application-supplied bridge class |
 
 Applications supply their settings, keychain and bridge adapters. Avoid adding
