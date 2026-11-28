@@ -48,6 +48,7 @@ sql:
     attrs: clauses
     constraints: named
     table_rename: none
+    column_move: position
     reorg: false
   unsupported_reasons:
     table_rename: "Firebird has no statement that renames a table; it has to be created again under the new name and its rows copied over"
